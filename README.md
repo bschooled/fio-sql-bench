@@ -17,7 +17,8 @@ Raw device benchmarking is intentionally blocked to reduce destructive risk.
 ## Prerequisites
 
 - PowerShell 7 or Windows PowerShell 5.1
-- `fio.exe` installed and available on `PATH`, or passed with `-FioPath`
+- `fio.exe` installed and available on `PATH`, or passed with `-FioPath` 
+  - You can find *fio* from the releases page of [Fio](https://github.com/axboe/fio)
 - Permission to create a dedicated test directory on the target volume or SMB share
 
 The script looks for `fio.exe` in:
@@ -74,7 +75,7 @@ If you want the script to emit the structured PowerShell result object in additi
 Dry-run the generated job and effective settings:
 
 ```powershell
-./scripts/Invoke-FioSqlBench.ps1 `
+.\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath 'C:\SqlBench' `
   -Profile Data `
   -DryRun
@@ -83,7 +84,7 @@ Dry-run the generated job and effective settings:
 Run against a local folder and keep the generated workload files for inspection:
 
 ```powershell
-./scripts/Invoke-FioSqlBench.ps1 `
+.\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath 'D:\SqlBench' `
   -Profile Data `
   -Iterations 3 `
@@ -100,7 +101,7 @@ The built-in `Data` and `Tempdb` profiles now default to larger working sets (`3
 Run against an SMB share with explicit buffered I/O:
 
 ```powershell
-./scripts/Invoke-FioSqlBench.ps1 `
+.\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath '\\fileserver\sqlbench' `
   -Profile Log `
   -Direct Off
@@ -109,7 +110,7 @@ Run against an SMB share with explicit buffered I/O:
 Run against a mapped SMB drive and let the script auto-detect it as SMB:
 
 ```powershell
-./scripts/Invoke-FioSqlBench.ps1 `
+.\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath 'Z:\SqlBench' `
   -Profile Data
 ```
@@ -117,7 +118,7 @@ Run against a mapped SMB drive and let the script auto-detect it as SMB:
 Override defaults for a custom SQL-like test while still using a built-in profile baseline:
 
 ```powershell
-./scripts/Invoke-FioSqlBench.ps1 `
+.\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath 'D:\SqlBench' `
   -Profile Tempdb `
   -FileSizeGB 32 `
@@ -128,7 +129,7 @@ Override defaults for a custom SQL-like test while still using a built-in profil
 
 ## Output Layout
 
-Each invocation writes results under `results/<timestamp>-<label>/`.
+Each invocation writes results under `results\<timestamp>-<label>\`.
 
 For larger runs, the harness now performs an explicit file-preparation phase before the timed benchmark phase and verifies that each benchmark file reached the expected size before random reads begin.
 
