@@ -170,6 +170,14 @@ Build a historical report across existing result folders:
   -ResultsRoot '.\results'
 ```
 
+Emit the aggregated historical object for automation while still writing the HTML, JSON, and CSV artifacts:
+
+```powershell
+.\scripts\Export-FioSqlBenchReport.ps1 `
+  -ResultsRoot '.\results' `
+  -PassThru
+```
+
 Optionally filter historical output to a subset of runs:
 
 ```powershell
@@ -213,6 +221,13 @@ The historical export script writes these additional artifacts under the chosen 
 - `historical-summary.json`: aggregated run-level data model across result folders
 - `historical-summary.csv`: flat run-level table for spreadsheets and diffing
 - `historical-report.html`: self-contained historical dashboard with rollup tables and inline charts
+
+The historical HTML report is intended to be comparative rather than just archival:
+
+- Recent runs are grouped by workload profile so `Data`, `Log`, `Tempdb`, `BackupRestore`, and `DbccScan` do not blur together.
+- Each row is compared against the previous run in the same profile, with deltas shown for read/write throughput and read/write `P99` latency.
+- Effective run settings are rendered as compact badges so changes in block size, queue depth, job count, direct I/O mode, runtime, and related knobs are visible at a glance.
+- When a setting changed relative to the previous run, the badge is highlighted and a short `Settings changed:` summary is printed under that row.
 
 The benchmark data files are created under the target directory in a unique subfolder. By default that target subfolder is removed after the run. Use `-NoCleanup` to keep it.
 If a run fails, the target work folder is preserved automatically so the generated files can be inspected.
