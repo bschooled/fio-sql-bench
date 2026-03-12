@@ -1,6 +1,20 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Remove-FioNullPadding {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    return $Value.Replace([string][char]0, '').Trim()
+}
+
 function Get-FioMappedSmbInfo {
     [CmdletBinding()]
     param(
@@ -26,11 +40,12 @@ function Get-FioMappedSmbInfo {
         return $null
     }
 
-    if ([string]::IsNullOrWhiteSpace($psDrive.DisplayRoot) -or -not $psDrive.DisplayRoot.StartsWith('\\')) {
+    $displayRoot = Remove-FioNullPadding -Value $psDrive.DisplayRoot
+    if ([string]::IsNullOrWhiteSpace($displayRoot) -or -not $displayRoot.StartsWith('\\')) {
         return $null
     }
 
-    $remoteRoot = $psDrive.DisplayRoot.TrimEnd('\\')
+    $remoteRoot = $displayRoot.TrimEnd('\\')
     $relativePath = $Path.Substring($root.Length).TrimStart('\\')
     $remotePath = if ([string]::IsNullOrWhiteSpace($relativePath)) {
         $remoteRoot
@@ -114,7 +129,7 @@ function Get-SmbTargetMetadata {
         [pscustomobject]$MappedSmbInfo
     )
 
-    $parsePath = if ($null -ne $MappedSmbInfo) { $MappedSmbInfo.RemotePath } else { $Path }
+    $parsePath = Remove-FioNullPadding -Value $(if ($null -ne $MappedSmbInfo) { $MappedSmbInfo.RemotePath } else { $Path })
     if (-not $parsePath.StartsWith('\\')) {
         return $null
     }
@@ -153,13 +168,14 @@ function Get-FioSqlBenchProfileDefaults {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Data', 'Log', 'Tempdb')]
+        [ValidateSet('Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan')]
         [string]$Profile
     )
 
     switch ($Profile) {
         'Data' {
             return [ordered]@{
+                ProfileName = 'Data'
                 FileSizeGB = 32
                 RuntimeSec = 60
                 RampSec = 10
@@ -176,6 +192,7 @@ function Get-FioSqlBenchProfileDefaults {
         }
         'Log' {
             return [ordered]@{
+                ProfileName = 'Log'
                 FileSizeGB = 8
                 RuntimeSec = 60
                 RampSec = 10
@@ -192,6 +209,7 @@ function Get-FioSqlBenchProfileDefaults {
         }
         'Tempdb' {
             return [ordered]@{
+                ProfileName = 'Tempdb'
                 FileSizeGB = 16
                 RuntimeSec = 60
                 RampSec = 10
@@ -204,6 +222,40 @@ function Get-FioSqlBenchProfileDefaults {
                 DirectLocal = 1
                 DirectSmb = 0
                 ReadWrite = 'randrw'
+            }
+        }
+        'BackupRestore' {
+            return [ordered]@{
+                ProfileName = 'BackupRestore'
+                FileSizeGB = 64
+                RuntimeSec = 90
+                RampSec = 10
+                Iterations = 1
+                QueueDepth = 8
+                NumJobs = 2
+                BlockSize = '1m'
+                ReadMix = 50
+                Fsync = 0
+                DirectLocal = 1
+                DirectSmb = 0
+                ReadWrite = 'rw'
+            }
+        }
+        'DbccScan' {
+            return [ordered]@{
+                ProfileName = 'DbccScan'
+                FileSizeGB = 32
+                RuntimeSec = 90
+                RampSec = 10
+                Iterations = 1
+                QueueDepth = 8
+                NumJobs = 2
+                BlockSize = '256k'
+                ReadMix = $null
+                Fsync = 0
+                DirectLocal = 1
+                DirectSmb = 0
+                ReadWrite = 'read'
             }
         }
     }
@@ -966,4 +1018,1188 @@ function Export-FioSqlBenchCsv {
     $rows | Export-Csv -Path $Path -NoTypeInformation -Encoding utf8
 }
 
-Export-ModuleMember -Function Resolve-FioSqlBenchTarget, Get-FioSqlBenchProfileDefaults, Merge-FioSqlBenchSettings, New-FioSqlBenchRunContext, New-FioSqlBenchJobContent, Get-FioBenchFilePaths, Test-FioPreparedFiles, Resolve-FioBinary, Invoke-FioSqlBenchRun, ConvertFrom-FioJsonToSummary, Export-FioSqlBenchCsv
+function Get-FioHistoricalAverageValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Items,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$ValueScript
+    )
+
+    $values = @(
+        foreach ($item in $Items) {
+            $value = & $ValueScript $item
+            if ($null -ne $value) {
+                [double]$value
+            }
+        }
+    )
+
+    if (-not $values -or $values.Count -eq 0) {
+        return $null
+    }
+
+    return [math]::Round((($values | Measure-Object -Average).Average), 2)
+}
+
+function Get-FioHistoricalTriplet {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object[]]$Values
+    )
+
+    $numeric = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ })
+    if ($numeric.Count -eq 0) {
+        return [pscustomobject]@{
+            Min = $null
+            Avg = $null
+            Max = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        Min = [math]::Round((($numeric | Measure-Object -Minimum).Minimum), 2)
+        Avg = [math]::Round((($numeric | Measure-Object -Average).Average), 2)
+        Max = [math]::Round((($numeric | Measure-Object -Maximum).Maximum), 2)
+    }
+}
+
+function Get-FioHistoryRunAggregate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$RootSummary,
+
+        [Parameter(Mandatory)]
+        [object[]]$Iterations,
+
+        [Parameter(Mandatory)]
+        [string]$SourceSummaryPath
+    )
+
+    $first = $Iterations[0]
+    $profileName = if ($RootSummary.PSObject.Properties['Profile'] -and -not [string]::IsNullOrWhiteSpace([string]$RootSummary.Profile)) {
+        [string]$RootSummary.Profile
+    }
+    else {
+        'Unknown'
+    }
+
+    $resultDirectory = if ($RootSummary.PSObject.Properties['ResultDirectory'] -and -not [string]::IsNullOrWhiteSpace([string]$RootSummary.ResultDirectory)) {
+        [string]$RootSummary.ResultDirectory
+    }
+    else {
+        Split-Path -Path $SourceSummaryPath -Parent
+    }
+
+    $timestampValues = @(
+        $Iterations |
+            ForEach-Object {
+                if ($_.PSObject.Properties['TimestampUtc'] -and -not [string]::IsNullOrWhiteSpace([string]$_.TimestampUtc)) {
+                    try {
+                        [DateTime]$_.TimestampUtc
+                    }
+                    catch {
+                        $null
+                    }
+                }
+            } |
+            Where-Object { $null -ne $_ }
+    )
+
+    $timestampUtc = if ($timestampValues.Count -gt 0) {
+        ($timestampValues | Sort-Object | Select-Object -First 1).ToString('o')
+    }
+    elseif ($RootSummary.PSObject.Properties['TimestampUtc'] -and -not [string]::IsNullOrWhiteSpace([string]$RootSummary.TimestampUtc)) {
+        [string]$RootSummary.TimestampUtc
+    }
+    else {
+        $null
+    }
+
+    $read = [pscustomobject]@{
+        Iops = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.Iops }
+        BandwidthMBps = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.BandwidthMBps }
+        IoMB = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.IoMB }
+        MeanLatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.MeanLatencyUs }
+        P50LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.P50LatencyUs }
+        P95LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.P95LatencyUs }
+        P99LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.P99LatencyUs }
+        P999LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.P999LatencyUs }
+    }
+
+    $write = [pscustomobject]@{
+        Iops = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.Iops }
+        BandwidthMBps = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.BandwidthMBps }
+        IoMB = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.IoMB }
+        MeanLatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.MeanLatencyUs }
+        P50LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.P50LatencyUs }
+        P95LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.P95LatencyUs }
+        P99LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.P99LatencyUs }
+        P999LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.P999LatencyUs }
+    }
+
+    return [pscustomobject]@{
+        RunId = if ($RootSummary.PSObject.Properties['RunId']) { [string]$RootSummary.RunId } else { [string]$first.RunId }
+        Profile = $profileName
+        TimestampUtc = $timestampUtc
+        ResultDirectory = $resultDirectory
+        SourceSummaryPath = $SourceSummaryPath
+        IterationCount = $Iterations.Count
+        TargetPath = [string]$first.TargetPath
+        TargetType = [string]$first.TargetType
+        SmbMetadata = if ($first.PSObject.Properties['SmbMetadata']) { $first.SmbMetadata } else { $null }
+        FioVersion = if ($first.PSObject.Properties['FioVersion']) { [string]$first.FioVersion } else { $null }
+        RuntimeSec = if ($first.PSObject.Properties['RuntimeSec']) { [int]$first.RuntimeSec } else { $null }
+        RampSec = if ($first.PSObject.Properties['RampSec']) { [int]$first.RampSec } else { $null }
+        FileSizeGB = if ($first.PSObject.Properties['FileSizeGB']) { [decimal]$first.FileSizeGB } else { $null }
+        BlockSize = if ($first.PSObject.Properties['BlockSize']) { [string]$first.BlockSize } else { $null }
+        QueueDepth = if ($first.PSObject.Properties['QueueDepth']) { [int]$first.QueueDepth } else { $null }
+        NumJobs = if ($first.PSObject.Properties['NumJobs']) { [int]$first.NumJobs } else { $null }
+        Direct = if ($first.PSObject.Properties['Direct']) { [int]$first.Direct } else { $null }
+        ReadWrite = if ($first.PSObject.Properties['ReadWrite']) { [string]$first.ReadWrite } else { $null }
+        ReadMix = if ($first.PSObject.Properties['ReadMix']) { $first.ReadMix } else { $null }
+        Fsync = if ($first.PSObject.Properties['Fsync']) { [int]$first.Fsync } else { $null }
+        Read = $read
+        Write = $write
+        Iterations = $Iterations
+    }
+}
+
+function Import-FioSqlBenchHistory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ResultsRoot,
+
+        [ValidateSet('Any', 'Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan')]
+        [string]$Profile = 'Any',
+
+        [ValidateSet('Any', 'Local', 'Smb')]
+        [string]$TargetType = 'Any',
+
+        [string]$TargetPathLike,
+
+        [Nullable[int]]$Newest
+    )
+
+    if (-not (Test-Path -LiteralPath $ResultsRoot)) {
+        throw "Results root '$ResultsRoot' does not exist."
+    }
+
+    $summaryFiles = @(Get-ChildItem -LiteralPath $ResultsRoot -Filter 'summary.json' -Recurse -File | Sort-Object FullName)
+    $runs = foreach ($file in $summaryFiles) {
+        $rootSummary = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json -Depth 100
+        $iterations = if ($rootSummary.PSObject.Properties['Iterations']) {
+            @($rootSummary.Iterations)
+        }
+        elseif ($rootSummary.PSObject.Properties['Iteration']) {
+            @($rootSummary)
+        }
+        else {
+            @()
+        }
+
+        if ($iterations.Count -eq 0) {
+            continue
+        }
+
+        $run = Get-FioHistoryRunAggregate -RootSummary $rootSummary -Iterations $iterations -SourceSummaryPath $file.FullName
+        if ($Profile -ne 'Any' -and $run.Profile -ine $Profile) {
+            continue
+        }
+
+        if ($TargetType -ne 'Any' -and $run.TargetType -ine $TargetType) {
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($TargetPathLike) -and $run.TargetPath -notlike $TargetPathLike) {
+            continue
+        }
+
+        $run
+    }
+
+    $ordered = @($runs | Sort-Object TimestampUtc)
+    if ($null -ne $Newest -and $Newest -gt 0) {
+        return @($ordered | Sort-Object TimestampUtc -Descending | Select-Object -First $Newest | Sort-Object TimestampUtc)
+    }
+
+    return $ordered
+}
+
+function Get-FioHistoricalRollup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Runs
+    )
+
+    if ($Runs.Count -eq 0) {
+        return @()
+    }
+
+    $groups = $Runs | Group-Object -Property {
+        '{0}|{1}|{2}' -f $_.Profile, $_.TargetType, $_.TargetPath
+    }
+
+    return @(
+        foreach ($group in $groups) {
+            $sample = $group.Group[0]
+            $orderedRuns = @($group.Group | Sort-Object TimestampUtc)
+            [pscustomobject]@{
+                Profile = $sample.Profile
+                TargetType = $sample.TargetType
+                TargetPath = $sample.TargetPath
+                RunCount = $group.Count
+                FirstTimestampUtc = $orderedRuns[0].TimestampUtc
+                LastTimestampUtc = $orderedRuns[-1].TimestampUtc
+                ReadIops = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { $_.Read.Iops })
+                ReadBandwidthMBps = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { $_.Read.BandwidthMBps })
+                ReadMeanLatencyMs = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { if ($null -ne $_.Read.MeanLatencyUs) { [math]::Round(($_.Read.MeanLatencyUs / 1000.0), 2) } })
+                ReadP99LatencyMs = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { if ($null -ne $_.Read.P99LatencyUs) { [math]::Round(($_.Read.P99LatencyUs / 1000.0), 2) } })
+                WriteIops = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { $_.Write.Iops })
+                WriteBandwidthMBps = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { $_.Write.BandwidthMBps })
+                WriteMeanLatencyMs = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { if ($null -ne $_.Write.MeanLatencyUs) { [math]::Round(($_.Write.MeanLatencyUs / 1000.0), 2) } })
+                WriteP99LatencyMs = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { if ($null -ne $_.Write.P99LatencyUs) { [math]::Round(($_.Write.P99LatencyUs / 1000.0), 2) } })
+            }
+        }
+    )
+}
+
+function Export-FioSqlBenchHistoricalCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Runs,
+
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $rows = foreach ($run in $Runs) {
+        [pscustomobject]@{
+            RunId = $run.RunId
+            Profile = $run.Profile
+            TimestampUtc = $run.TimestampUtc
+            ResultDirectory = $run.ResultDirectory
+            TargetPath = $run.TargetPath
+            TargetType = $run.TargetType
+            IterationCount = $run.IterationCount
+            FioVersion = $run.FioVersion
+            RuntimeSec = $run.RuntimeSec
+            RampSec = $run.RampSec
+            FileSizeGB = $run.FileSizeGB
+            BlockSize = $run.BlockSize
+            QueueDepth = $run.QueueDepth
+            NumJobs = $run.NumJobs
+            Direct = $run.Direct
+            ReadWrite = $run.ReadWrite
+            ReadMix = $run.ReadMix
+            Fsync = $run.Fsync
+            ReadIops = $run.Read.Iops
+            ReadBandwidthMBps = $run.Read.BandwidthMBps
+            ReadMeanLatencyUs = $run.Read.MeanLatencyUs
+            ReadP95LatencyUs = $run.Read.P95LatencyUs
+            ReadP99LatencyUs = $run.Read.P99LatencyUs
+            WriteIops = $run.Write.Iops
+            WriteBandwidthMBps = $run.Write.BandwidthMBps
+            WriteMeanLatencyUs = $run.Write.MeanLatencyUs
+            WriteP95LatencyUs = $run.Write.P95LatencyUs
+            WriteP99LatencyUs = $run.Write.P99LatencyUs
+        }
+    }
+
+    $rows | Export-Csv -Path $Path -NoTypeInformation -Encoding utf8
+}
+
+function ConvertTo-FioHtmlEncoded {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+}
+
+function Format-FioHtmlMetric {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [double]$Value,
+
+        [string]$Suffix = '',
+
+        [int]$Decimals = 2
+    )
+
+    if ($null -eq $Value) {
+        return '-'
+    }
+
+    return ('{0:N' + $Decimals + '}{1}') -f $Value, $Suffix
+}
+
+function Format-FioHtmlTimestamp {
+        [CmdletBinding()]
+        param(
+                [AllowNull()]
+                [string]$TimestampUtc
+        )
+
+        if ([string]::IsNullOrWhiteSpace($TimestampUtc)) {
+                return '-'
+        }
+
+        try {
+                return ([DateTimeOffset]::Parse($TimestampUtc)).ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+        }
+        catch {
+                return $TimestampUtc
+        }
+}
+
+function Format-FioHtmlDelta {
+        [CmdletBinding()]
+        param(
+                [AllowNull()]
+                [double]$Current,
+
+                [AllowNull()]
+                [double]$Previous,
+
+                [string]$Suffix = '',
+
+                [switch]$LowerIsBetter
+        )
+
+        if ($null -eq $Current -or $null -eq $Previous) {
+                return [pscustomobject]@{
+                        Text = 'Baseline'
+                        Class = 'delta-neutral'
+                }
+        }
+
+        $delta = [math]::Round(($Current - $Previous), 2)
+        $percent = if ($Previous -eq 0) { $null } else { [math]::Round((($delta / $Previous) * 100.0), 1) }
+        $improved = if ($LowerIsBetter) { $delta -lt 0 } else { $delta -gt 0 }
+        $class = if ($delta -eq 0) { 'delta-neutral' } elseif ($improved) { 'delta-good' } else { 'delta-bad' }
+        $sign = if ($delta -gt 0) { '+' } else { '' }
+        $percentText = if ($null -eq $percent) { '' } else { ' ({0}{1:N1}%)' -f $sign, $percent }
+
+        return [pscustomobject]@{
+                Text = ('{0}{1:N2}{2}{3}' -f $sign, $delta, $Suffix, $percentText)
+                Class = $class
+        }
+}
+
+    function ConvertTo-FioHtmlSettingBadges {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [object[]]$Settings,
+
+            [hashtable]$PreviousValues
+        )
+
+        $badges = New-Object System.Collections.Generic.List[string]
+        foreach ($setting in $Settings) {
+            if ($null -eq $setting -or [string]::IsNullOrWhiteSpace([string]$setting.Value)) {
+                continue
+            }
+
+            $label = if ($setting.PSObject.Properties['Label']) { [string]$setting.Label } else { [string]$setting.Key }
+            $value = [string]$setting.Value
+            $className = 'setting-badge'
+            $title = '{0}={1}' -f $label, $value
+
+            if ($null -ne $PreviousValues -and $PreviousValues.ContainsKey([string]$setting.Key)) {
+                $previousValue = [string]$PreviousValues[[string]$setting.Key]
+                if ($previousValue -ne $value) {
+                    $className += ' setting-badge-changed'
+                    $title = '{0} changed from {1} to {2}' -f $label, $previousValue, $value
+                }
+            }
+
+            $badges.Add(@"
+    <span class='$className' title='$([System.Net.WebUtility]::HtmlEncode($title))'>
+      <span class='setting-key'>$([System.Net.WebUtility]::HtmlEncode($label))</span>
+      <span class='setting-value'>$([System.Net.WebUtility]::HtmlEncode($value))</span>
+    </span>
+    "@)
+        }
+
+        if ($badges.Count -eq 0) {
+            return "<span class='setting-badge setting-badge-empty'>No settings captured</span>"
+        }
+
+        return ($badges -join [Environment]::NewLine)
+    }
+
+function New-FioHtmlProfileComparisonSection {
+        [CmdletBinding()]
+        param(
+                [Parameter(Mandatory)]
+                [string]$Profile,
+
+                [Parameter(Mandatory)]
+                [object[]]$Runs
+        )
+
+        $orderedRuns = @($Runs | Sort-Object TimestampUtc)
+        $recentRuns = @($orderedRuns | Select-Object -Last 6)
+        $maxRead = @($recentRuns | ForEach-Object { $_.Read.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+        $maxWrite = @($recentRuns | ForEach-Object { $_.Write.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+        if ($null -eq $maxRead -or $maxRead -le 0) { $maxRead = 1 }
+        if ($null -eq $maxWrite -or $maxWrite -le 0) { $maxWrite = 1 }
+
+        $rows = New-Object System.Collections.Generic.List[string]
+        for ($index = 0; $index -lt $recentRuns.Count; $index++) {
+                $run = $recentRuns[$index]
+                $previous = if ($index -gt 0) { $recentRuns[$index - 1] } else { $null }
+                $readP99Ms = if ($null -ne $run.Read.P99LatencyUs) { [math]::Round(($run.Read.P99LatencyUs / 1000.0), 2) } else { $null }
+                $writeP99Ms = if ($null -ne $run.Write.P99LatencyUs) { [math]::Round(($run.Write.P99LatencyUs / 1000.0), 2) } else { $null }
+                $previousReadP99Ms = if ($null -ne $previous -and $null -ne $previous.Read.P99LatencyUs) { [math]::Round(($previous.Read.P99LatencyUs / 1000.0), 2) } else { $null }
+                $previousWriteP99Ms = if ($null -ne $previous -and $null -ne $previous.Write.P99LatencyUs) { [math]::Round(($previous.Write.P99LatencyUs / 1000.0), 2) } else { $null }
+                $readDelta = Format-FioHtmlDelta -Current $run.Read.BandwidthMBps -Previous $(if ($null -ne $previous) { $previous.Read.BandwidthMBps } else { $null }) -Suffix ' MB/s'
+                $writeDelta = Format-FioHtmlDelta -Current $run.Write.BandwidthMBps -Previous $(if ($null -ne $previous) { $previous.Write.BandwidthMBps } else { $null }) -Suffix ' MB/s'
+                $readLatencyDelta = Format-FioHtmlDelta -Current $readP99Ms -Previous $previousReadP99Ms -Suffix ' ms' -LowerIsBetter
+                $writeLatencyDelta = Format-FioHtmlDelta -Current $writeP99Ms -Previous $previousWriteP99Ms -Suffix ' ms' -LowerIsBetter
+                $readWidth = [math]::Round((($run.Read.BandwidthMBps / $maxRead) * 100.0), 2)
+                $writeWidth = [math]::Round((($run.Write.BandwidthMBps / $maxWrite) * 100.0), 2)
+                $runSettings = @(
+                    [pscustomobject]@{ Key = 'BlockSize'; Label = 'bs'; Value = $run.BlockSize }
+                    [pscustomobject]@{ Key = 'QueueDepth'; Label = 'qd'; Value = if ($null -ne $run.QueueDepth) { [string]$run.QueueDepth } else { $null } }
+                    [pscustomobject]@{ Key = 'NumJobs'; Label = 'jobs'; Value = if ($null -ne $run.NumJobs) { [string]$run.NumJobs } else { $null } }
+                    [pscustomobject]@{ Key = 'FileSizeGB'; Label = 'size'; Value = if ($null -ne $run.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$run.FileSizeGB, 2)) } else { $null } }
+                    [pscustomobject]@{ Key = 'ReadWrite'; Label = 'rw'; Value = $run.ReadWrite }
+                    [pscustomobject]@{ Key = 'ReadMix'; Label = 'mix'; Value = if ($null -ne $run.ReadMix) { '{0}/{1}' -f $run.ReadMix, (100 - [int]$run.ReadMix) } else { $null } }
+                    [pscustomobject]@{ Key = 'Direct'; Label = 'direct'; Value = if ($null -ne $run.Direct) { [string]$run.Direct } else { $null } }
+                    [pscustomobject]@{ Key = 'Fsync'; Label = 'fsync'; Value = if ($null -ne $run.Fsync -and $run.Fsync -gt 0) { [string]$run.Fsync } else { $null } }
+                    [pscustomobject]@{ Key = 'RuntimeSec'; Label = 'runtime'; Value = if ($null -ne $run.RuntimeSec) { '{0}s' -f $run.RuntimeSec } else { $null } }
+                )
+                $runTargetSettings = @(
+                    [pscustomobject]@{ Key = 'IterationCount'; Label = 'iters'; Value = if ($null -ne $run.IterationCount) { [string]$run.IterationCount } else { $null } }
+                    [pscustomobject]@{ Key = 'FioVersion'; Label = 'fio'; Value = $run.FioVersion }
+                    [pscustomobject]@{ Key = 'TargetType'; Label = 'type'; Value = $run.TargetType }
+                )
+                $previousRunSettings = $null
+                $previousTargetSettings = $null
+                if ($null -ne $previous) {
+                    $previousRunSettings = @{}
+                    foreach ($setting in @(
+                        [pscustomobject]@{ Key = 'BlockSize'; Value = $previous.BlockSize }
+                        [pscustomobject]@{ Key = 'QueueDepth'; Value = if ($null -ne $previous.QueueDepth) { [string]$previous.QueueDepth } else { $null } }
+                        [pscustomobject]@{ Key = 'NumJobs'; Value = if ($null -ne $previous.NumJobs) { [string]$previous.NumJobs } else { $null } }
+                        [pscustomobject]@{ Key = 'FileSizeGB'; Value = if ($null -ne $previous.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$previous.FileSizeGB, 2)) } else { $null } }
+                        [pscustomobject]@{ Key = 'ReadWrite'; Value = $previous.ReadWrite }
+                        [pscustomobject]@{ Key = 'ReadMix'; Value = if ($null -ne $previous.ReadMix) { '{0}/{1}' -f $previous.ReadMix, (100 - [int]$previous.ReadMix) } else { $null } }
+                        [pscustomobject]@{ Key = 'Direct'; Value = if ($null -ne $previous.Direct) { [string]$previous.Direct } else { $null } }
+                        [pscustomobject]@{ Key = 'Fsync'; Value = if ($null -ne $previous.Fsync -and $previous.Fsync -gt 0) { [string]$previous.Fsync } else { $null } }
+                        [pscustomobject]@{ Key = 'RuntimeSec'; Value = if ($null -ne $previous.RuntimeSec) { '{0}s' -f $previous.RuntimeSec } else { $null } }
+                    )) {
+                        $previousRunSettings[[string]$setting.Key] = $setting.Value
+                    }
+
+                    $previousTargetSettings = @{}
+                    foreach ($setting in @(
+                        [pscustomobject]@{ Key = 'IterationCount'; Value = if ($null -ne $previous.IterationCount) { [string]$previous.IterationCount } else { $null } }
+                        [pscustomobject]@{ Key = 'FioVersion'; Value = $previous.FioVersion }
+                        [pscustomobject]@{ Key = 'TargetType'; Value = $previous.TargetType }
+                    )) {
+                        $previousTargetSettings[[string]$setting.Key] = $setting.Value
+                    }
+                }
+                $settingsBadgeHtml = ConvertTo-FioHtmlSettingBadges -Settings $runSettings -PreviousValues $previousRunSettings
+                $targetBadgeHtml = ConvertTo-FioHtmlSettingBadges -Settings $runTargetSettings -PreviousValues $previousTargetSettings
+
+                $rows.Add(@"
+<tr>
+    <td>
+        <div class='run-date'>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $run.TimestampUtc)))</div>
+        <div class='subtle'>$([System.Net.WebUtility]::HtmlEncode([string]$run.RunId))</div>
+            <div class='settings-badges'>
+                $settingsBadgeHtml
+            </div>
+    </td>
+    <td>
+        <div>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetType))</div>
+        <div class='subtle'>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetPath))</div>
+            <div class='settings-badges'>
+                $targetBadgeHtml
+            </div>
+    </td>
+    <td>
+        <div class='metric-cell'>
+            <span>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Read.BandwidthMBps -Suffix ' MB/s')))</span>
+            <div class='mini-track'><div class='mini-fill throughput-read' style='width: ${readWidth}%'></div></div>
+        </div>
+        <div class='delta $($readDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($readDelta.Text))</div>
+    </td>
+    <td>
+        <div class='metric-cell'>
+            <span>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Write.BandwidthMBps -Suffix ' MB/s')))</span>
+            <div class='mini-track'><div class='mini-fill throughput-write' style='width: ${writeWidth}%'></div></div>
+        </div>
+        <div class='delta $($writeDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($writeDelta.Text))</div>
+    </td>
+    <td>
+        <div>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $readP99Ms -Suffix ' ms')))</div>
+        <div class='delta $($readLatencyDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($readLatencyDelta.Text))</div>
+    </td>
+    <td>
+        <div>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $writeP99Ms -Suffix ' ms')))</div>
+        <div class='delta $($writeLatencyDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($writeLatencyDelta.Text))</div>
+    </td>
+</tr>
+"@)
+        }
+
+        return @"
+<section class='table-card profile-card'>
+    <div class='section-heading'>
+        <div>
+            <h2>$([System.Net.WebUtility]::HtmlEncode($Profile))</h2>
+            <p>Recent runs for this workload profile, with each row compared against the previous run in the same profile.</p>
+        </div>
+        <div class='pill'>$($recentRuns.Count) runs shown</div>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>Run Time</th>
+                <th>Target</th>
+                <th>Read Throughput</th>
+                <th>Write Throughput</th>
+                <th>Read P99</th>
+                <th>Write P99</th>
+            </tr>
+        </thead>
+        <tbody>
+            $($rows -join [Environment]::NewLine)
+        </tbody>
+    </table>
+</section>
+"@
+}
+
+function New-FioHtmlBarChartSection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title,
+
+        [Parameter(Mandatory)]
+        [object[]]$Runs,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$ValueScript,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$LabelScript,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$FormatScript,
+
+        [Parameter(Mandatory)]
+        [string]$BarClass
+    )
+
+    $points = @(
+        foreach ($run in $Runs) {
+            $value = & $ValueScript $run
+            [pscustomobject]@{
+                Label = & $LabelScript $run
+                Value = if ($null -ne $value) { [double]$value } else { $null }
+                Display = & $FormatScript $value
+            }
+        }
+    )
+
+    $maxValue = @($points | ForEach-Object { $_.Value } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+    if ($null -eq $maxValue -or $maxValue -le 0) {
+        $maxValue = 1
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("<section class='chart-card'><h2>$([System.Net.WebUtility]::HtmlEncode($Title))</h2>")
+    foreach ($point in $points) {
+        $width = if ($null -eq $point.Value) { 0 } else { [math]::Round(($point.Value / $maxValue) * 100, 2) }
+        $lines.Add(@"
+<div class='bar-row'>
+  <div class='bar-label'>$([System.Net.WebUtility]::HtmlEncode([string]$point.Label))</div>
+  <div class='bar-track'><div class='bar-fill $BarClass' style='width: ${width}%'></div></div>
+  <div class='bar-value'>$([System.Net.WebUtility]::HtmlEncode([string]$point.Display))</div>
+</div>
+"@)
+    }
+    $lines.Add('</section>')
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Export-FioSqlBenchHtmlReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Runs,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [string]$Title = 'fio SQL Bench Report',
+
+        [string]$ResultsRoot,
+
+        [object[]]$Rollups
+    )
+
+        function local:ConvertToHtmlSettingBadges {
+                param(
+                        [object[]]$Settings,
+                        [hashtable]$PreviousValues
+                )
+
+                $badges = New-Object System.Collections.Generic.List[string]
+                $normalBadges = New-Object System.Collections.Generic.List[string]
+                $changedBadges = New-Object System.Collections.Generic.List[string]
+
+                foreach ($setting in $Settings) {
+                        if ($null -eq $setting -or [string]::IsNullOrWhiteSpace([string]$setting.Value)) {
+                                continue
+                        }
+
+                        $label = if ($setting.PSObject.Properties['Label']) { [string]$setting.Label } else { [string]$setting.Key }
+                        $value = [string]$setting.Value
+                        $className = 'setting-badge'
+                        $title = '{0}={1}' -f $label, $value
+                        $isChanged = $false
+
+                        if ($null -ne $PreviousValues -and $PreviousValues.ContainsKey([string]$setting.Key)) {
+                                $previousValue = [string]$PreviousValues[[string]$setting.Key]
+                                if ($previousValue -ne $value) {
+                                        $className += ' setting-badge-changed'
+                                        $title = '{0} changed from {1} to {2}' -f $label, $previousValue, $value
+                                        $isChanged = $true
+                                }
+                        }
+
+                        $badgeHtml = @"
+<span class='$className' title='$([System.Net.WebUtility]::HtmlEncode($title))'>
+    <span class='setting-key'>$([System.Net.WebUtility]::HtmlEncode($label))</span>
+    <span class='setting-value'>$([System.Net.WebUtility]::HtmlEncode($value))</span>
+</span>
+"@
+
+                        if ($isChanged) {
+                                $changedBadges.Add($badgeHtml)
+                        }
+                        else {
+                                $normalBadges.Add($badgeHtml)
+                        }
+                }
+
+                foreach ($badge in $changedBadges) {
+                        $badges.Add($badge)
+                }
+                foreach ($badge in $normalBadges) {
+                        $badges.Add($badge)
+                }
+
+                if ($badges.Count -eq 0) {
+                        return "<span class='setting-badge setting-badge-empty'>No settings captured</span>"
+                }
+
+                return ($badges -join [Environment]::NewLine)
+        }
+
+        function local:GetSettingsChangeSummary {
+                param(
+                        [object[]]$Settings,
+                        [hashtable]$PreviousValues
+                )
+
+                if ($null -eq $PreviousValues) {
+                        return 'Baseline settings'
+                }
+
+                $changes = New-Object System.Collections.Generic.List[string]
+                foreach ($setting in $Settings) {
+                        if ($null -eq $setting -or [string]::IsNullOrWhiteSpace([string]$setting.Value)) {
+                                continue
+                        }
+
+                        $key = [string]$setting.Key
+                        if (-not $PreviousValues.ContainsKey($key)) {
+                                continue
+                        }
+
+                        $previousValue = [string]$PreviousValues[$key]
+                        $currentValue = [string]$setting.Value
+                        if ($previousValue -ne $currentValue) {
+                                $label = if ($setting.PSObject.Properties['Label']) { [string]$setting.Label } else { $key }
+                                $changes.Add(('{0}: {1} -> {2}' -f $label, $previousValue, $currentValue))
+                        }
+                }
+
+                if ($changes.Count -eq 0) {
+                        return 'Settings unchanged'
+                }
+
+                return ('Settings changed: ' + ($changes -join ', '))
+        }
+
+        function local:NewProfileComparisonSection {
+                param(
+                        [string]$Profile,
+                        [object[]]$ProfileRuns
+                )
+
+                $orderedProfileRuns = @($ProfileRuns | Sort-Object TimestampUtc)
+                $recentProfileRuns = @($orderedProfileRuns | Select-Object -Last 6)
+                $maxRead = @($recentProfileRuns | ForEach-Object { $_.Read.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+                $maxWrite = @($recentProfileRuns | ForEach-Object { $_.Write.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+                if ($null -eq $maxRead -or $maxRead -le 0) { $maxRead = 1 }
+                if ($null -eq $maxWrite -or $maxWrite -le 0) { $maxWrite = 1 }
+
+                $rows = New-Object System.Collections.Generic.List[string]
+                for ($index = 0; $index -lt $recentProfileRuns.Count; $index++) {
+                        $run = $recentProfileRuns[$index]
+                        $previous = if ($index -gt 0) { $recentProfileRuns[$index - 1] } else { $null }
+                        $readP99Ms = if ($null -ne $run.Read.P99LatencyUs) { [math]::Round(($run.Read.P99LatencyUs / 1000.0), 2) } else { $null }
+                        $writeP99Ms = if ($null -ne $run.Write.P99LatencyUs) { [math]::Round(($run.Write.P99LatencyUs / 1000.0), 2) } else { $null }
+                        $previousReadP99Ms = if ($null -ne $previous -and $null -ne $previous.Read.P99LatencyUs) { [math]::Round(($previous.Read.P99LatencyUs / 1000.0), 2) } else { $null }
+                        $previousWriteP99Ms = if ($null -ne $previous -and $null -ne $previous.Write.P99LatencyUs) { [math]::Round(($previous.Write.P99LatencyUs / 1000.0), 2) } else { $null }
+                        $readDelta = Format-FioHtmlDelta -Current $run.Read.BandwidthMBps -Previous $(if ($null -ne $previous) { $previous.Read.BandwidthMBps } else { $null }) -Suffix ' MB/s'
+                        $writeDelta = Format-FioHtmlDelta -Current $run.Write.BandwidthMBps -Previous $(if ($null -ne $previous) { $previous.Write.BandwidthMBps } else { $null }) -Suffix ' MB/s'
+                        $readLatencyDelta = Format-FioHtmlDelta -Current $readP99Ms -Previous $previousReadP99Ms -Suffix ' ms' -LowerIsBetter
+                        $writeLatencyDelta = Format-FioHtmlDelta -Current $writeP99Ms -Previous $previousWriteP99Ms -Suffix ' ms' -LowerIsBetter
+                        $readWidth = [math]::Round((($run.Read.BandwidthMBps / $maxRead) * 100.0), 2)
+                        $writeWidth = [math]::Round((($run.Write.BandwidthMBps / $maxWrite) * 100.0), 2)
+
+                        $runSettings = @(
+                                [pscustomobject]@{ Key = 'BlockSize'; Label = 'bs'; Value = $run.BlockSize }
+                                [pscustomobject]@{ Key = 'QueueDepth'; Label = 'qd'; Value = if ($null -ne $run.QueueDepth) { [string]$run.QueueDepth } else { $null } }
+                                [pscustomobject]@{ Key = 'NumJobs'; Label = 'jobs'; Value = if ($null -ne $run.NumJobs) { [string]$run.NumJobs } else { $null } }
+                                [pscustomobject]@{ Key = 'FileSizeGB'; Label = 'size'; Value = if ($null -ne $run.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$run.FileSizeGB, 2)) } else { $null } }
+                                [pscustomobject]@{ Key = 'ReadWrite'; Label = 'rw'; Value = $run.ReadWrite }
+                                [pscustomobject]@{ Key = 'ReadMix'; Label = 'mix'; Value = if ($null -ne $run.ReadMix) { '{0}/{1}' -f $run.ReadMix, (100 - [int]$run.ReadMix) } else { $null } }
+                                [pscustomobject]@{ Key = 'Direct'; Label = 'direct'; Value = if ($null -ne $run.Direct) { [string]$run.Direct } else { $null } }
+                                [pscustomobject]@{ Key = 'Fsync'; Label = 'fsync'; Value = if ($null -ne $run.Fsync -and $run.Fsync -gt 0) { [string]$run.Fsync } else { $null } }
+                                [pscustomobject]@{ Key = 'RuntimeSec'; Label = 'runtime'; Value = if ($null -ne $run.RuntimeSec) { '{0}s' -f $run.RuntimeSec } else { $null } }
+                        )
+                        $targetSettings = @(
+                                [pscustomobject]@{ Key = 'IterationCount'; Label = 'iters'; Value = if ($null -ne $run.IterationCount) { [string]$run.IterationCount } else { $null } }
+                                [pscustomobject]@{ Key = 'FioVersion'; Label = 'fio'; Value = $run.FioVersion }
+                                [pscustomobject]@{ Key = 'TargetType'; Label = 'type'; Value = $run.TargetType }
+                        )
+
+                        $previousRunSettings = $null
+                        $previousTargetSettings = $null
+                        if ($null -ne $previous) {
+                                $previousRunSettings = @{
+                                        BlockSize = $previous.BlockSize
+                                        QueueDepth = if ($null -ne $previous.QueueDepth) { [string]$previous.QueueDepth } else { $null }
+                                        NumJobs = if ($null -ne $previous.NumJobs) { [string]$previous.NumJobs } else { $null }
+                                        FileSizeGB = if ($null -ne $previous.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$previous.FileSizeGB, 2)) } else { $null }
+                                        ReadWrite = $previous.ReadWrite
+                                        ReadMix = if ($null -ne $previous.ReadMix) { '{0}/{1}' -f $previous.ReadMix, (100 - [int]$previous.ReadMix) } else { $null }
+                                        Direct = if ($null -ne $previous.Direct) { [string]$previous.Direct } else { $null }
+                                        Fsync = if ($null -ne $previous.Fsync -and $previous.Fsync -gt 0) { [string]$previous.Fsync } else { $null }
+                                        RuntimeSec = if ($null -ne $previous.RuntimeSec) { '{0}s' -f $previous.RuntimeSec } else { $null }
+                                }
+                                $previousTargetSettings = @{
+                                        IterationCount = if ($null -ne $previous.IterationCount) { [string]$previous.IterationCount } else { $null }
+                                        FioVersion = $previous.FioVersion
+                                        TargetType = $previous.TargetType
+                                }
+                        }
+
+                        $settingsBadgeHtml = ConvertToHtmlSettingBadges -Settings $runSettings -PreviousValues $previousRunSettings
+                        $targetBadgeHtml = ConvertToHtmlSettingBadges -Settings $targetSettings -PreviousValues $previousTargetSettings
+                        $runChangeSummary = GetSettingsChangeSummary -Settings $runSettings -PreviousValues $previousRunSettings
+                        $targetChangeSummary = GetSettingsChangeSummary -Settings $targetSettings -PreviousValues $previousTargetSettings
+
+                        $rows.Add(@"
+<tr>
+    <td>
+        <div class='run-date'>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $run.TimestampUtc)))</div>
+        <div class='subtle'>$([System.Net.WebUtility]::HtmlEncode([string]$run.RunId))</div>
+        <div class='settings-summary'>$([System.Net.WebUtility]::HtmlEncode($runChangeSummary))</div>
+        <div class='settings-badges'>
+            $settingsBadgeHtml
+        </div>
+    </td>
+    <td>
+        <div>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetType))</div>
+        <div class='subtle'>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetPath))</div>
+        <div class='settings-summary'>$([System.Net.WebUtility]::HtmlEncode($targetChangeSummary))</div>
+        <div class='settings-badges'>
+            $targetBadgeHtml
+        </div>
+    </td>
+    <td>
+        <div class='metric-cell'>
+            <span>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Read.BandwidthMBps -Suffix ' MB/s')))</span>
+            <div class='mini-track'><div class='mini-fill throughput-read' style='width: ${readWidth}%'></div></div>
+        </div>
+        <div class='delta $($readDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($readDelta.Text))</div>
+    </td>
+    <td>
+        <div class='metric-cell'>
+            <span>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Write.BandwidthMBps -Suffix ' MB/s')))</span>
+            <div class='mini-track'><div class='mini-fill throughput-write' style='width: ${writeWidth}%'></div></div>
+        </div>
+        <div class='delta $($writeDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($writeDelta.Text))</div>
+    </td>
+    <td>
+        <div>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $readP99Ms -Suffix ' ms')))</div>
+        <div class='delta $($readLatencyDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($readLatencyDelta.Text))</div>
+    </td>
+    <td>
+        <div>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $writeP99Ms -Suffix ' ms')))</div>
+        <div class='delta $($writeLatencyDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($writeLatencyDelta.Text))</div>
+    </td>
+</tr>
+"@)
+                }
+
+                return @"
+<section class='table-card profile-card'>
+    <div class='section-heading'>
+        <div>
+            <h2>$([System.Net.WebUtility]::HtmlEncode($Profile))</h2>
+            <p>Recent runs for this workload profile, with each row compared against the previous run in the same profile.</p>
+        </div>
+        <div class='pill'>$($recentProfileRuns.Count) runs shown</div>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>Run Time</th>
+                <th>Target</th>
+                <th>Read Throughput</th>
+                <th>Write Throughput</th>
+                <th>Read P99</th>
+                <th>Write P99</th>
+            </tr>
+        </thead>
+        <tbody>
+            $($rows -join [Environment]::NewLine)
+        </tbody>
+    </table>
+</section>
+"@
+        }
+
+    if ($Runs.Count -eq 0) {
+        throw 'Cannot build an HTML report without any runs.'
+    }
+
+    $orderedRuns = @($Runs | Sort-Object TimestampUtc)
+    $profileCount = @($orderedRuns.Profile | Sort-Object -Unique).Count
+    $smbRuns = @($orderedRuns | Where-Object { $_.TargetType -eq 'Smb' }).Count
+    $localRuns = @($orderedRuns | Where-Object { $_.TargetType -eq 'Local' }).Count
+    $rollupRows = if ($null -ne $Rollups) { @($Rollups) } else { @(Get-FioHistoricalRollup -Runs $orderedRuns) }
+    $profileSections = @(
+        foreach ($profileGroup in ($orderedRuns | Group-Object Profile | Sort-Object Name)) {
+            NewProfileComparisonSection -Profile $profileGroup.Name -ProfileRuns @($profileGroup.Group)
+        }
+    )
+
+    $runTableRows = New-Object System.Collections.Generic.List[string]
+    foreach ($run in ($orderedRuns | Sort-Object TimestampUtc -Descending)) {
+        $readMeanMs = if ($null -ne $run.Read.MeanLatencyUs) { [math]::Round(($run.Read.MeanLatencyUs / 1000.0), 2) } else { $null }
+        $writeMeanMs = if ($null -ne $run.Write.MeanLatencyUs) { [math]::Round(($run.Write.MeanLatencyUs / 1000.0), 2) } else { $null }
+        $runTableRows.Add(@"
+<tr>
+    <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $run.TimestampUtc)))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.Profile))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetType))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetPath))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.IterationCount))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Read.BandwidthMBps -Suffix ' MB/s')))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Write.BandwidthMBps -Suffix ' MB/s')))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $readMeanMs -Suffix ' ms')))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $writeMeanMs -Suffix ' ms')))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.ResultDirectory))</td>
+</tr>
+"@)
+    }
+
+    $rollupTableRows = New-Object System.Collections.Generic.List[string]
+    foreach ($rollup in ($rollupRows | Sort-Object Profile, TargetType, TargetPath)) {
+        $rollupTableRows.Add(@"
+<tr>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$rollup.Profile))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$rollup.TargetType))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$rollup.TargetPath))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode([string]$rollup.RunCount))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $rollup.ReadBandwidthMBps.Avg -Suffix ' MB/s')))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $rollup.WriteBandwidthMBps.Avg -Suffix ' MB/s')))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $rollup.ReadMeanLatencyMs.Avg -Suffix ' ms')))</td>
+  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $rollup.WriteMeanLatencyMs.Avg -Suffix ' ms')))</td>
+    <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $rollup.LastTimestampUtc)))</td>
+</tr>
+"@)
+    }
+
+    $html = @"
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+  <meta charset='utf-8' />
+  <meta name='viewport' content='width=device-width, initial-scale=1' />
+  <title>$([System.Net.WebUtility]::HtmlEncode($Title))</title>
+  <style>
+    :root {
+      --bg: #f4f1e8;
+      --panel: #fffdf8;
+      --ink: #1e2a2f;
+      --muted: #65737a;
+      --line: #d9d0bd;
+      --accent: #0f766e;
+      --accent-2: #b45309;
+      --accent-3: #1d4ed8;
+      --shadow: rgba(30, 42, 47, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #efe7d6 0%, var(--bg) 220px);
+    }
+    main { max-width: 1400px; margin: 0 auto; padding: 32px 24px 48px; }
+    h1, h2 { margin: 0 0 12px; }
+    p { margin: 0; color: var(--muted); }
+    .hero, .card, .chart-card, .table-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: 0 12px 32px var(--shadow);
+    }
+    .hero { padding: 24px; margin-bottom: 20px; }
+        .hero-grid, .metric-grid, .chart-grid { display: grid; gap: 16px; }
+    .hero-grid { grid-template-columns: 2fr 1fr; align-items: end; }
+    .metric-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top: 20px; }
+    .chart-grid { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); margin: 20px 0; }
+    .card { padding: 18px; }
+    .metric-label { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .metric-value { font-size: 28px; font-weight: 700; margin-top: 6px; }
+    .meta { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; margin-top: 14px; color: var(--muted); }
+    .chart-card, .table-card { padding: 18px; }
+        .profile-grid { display: grid; gap: 18px; margin: 20px 0; }
+        .profile-card { overflow-x: auto; }
+        .section-heading {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+        .pill {
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 12px;
+            color: var(--muted);
+            white-space: nowrap;
+        }
+    .bar-row {
+      display: grid;
+      grid-template-columns: minmax(140px, 1.2fr) 3fr minmax(90px, 0.8fr);
+      gap: 12px;
+      align-items: center;
+      margin-top: 12px;
+    }
+    .bar-label, .bar-value { font-size: 13px; }
+    .bar-track {
+      height: 14px;
+      background: #ece6d8;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: var(--accent);
+    }
+        .mini-track {
+            height: 8px;
+            background: #ece6d8;
+            border-radius: 999px;
+            overflow: hidden;
+            min-width: 84px;
+        }
+        .mini-fill {
+            height: 100%;
+            border-radius: 999px;
+        }
+        .metric-cell {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 10px;
+            align-items: center;
+        }
+        .delta {
+            margin-top: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .delta-good { color: #0f766e; }
+        .delta-bad { color: #b42318; }
+        .delta-neutral { color: var(--muted); }
+        .run-date { font-weight: 600; }
+        .subtle {
+            font-size: 12px;
+            color: var(--muted);
+            margin-top: 3px;
+            word-break: break-word;
+        }
+        .settings-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        .settings-summary {
+            margin-top: 8px;
+            font-size: 11px;
+            color: #7c5e10;
+            background: #fff7e6;
+            border: 1px solid #f1d39b;
+            border-radius: 10px;
+            padding: 6px 8px;
+            line-height: 1.35;
+        }
+        .setting-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 3px 8px;
+            font-size: 11px;
+            line-height: 1.3;
+            color: var(--muted);
+            background: #faf6ed;
+        }
+        .setting-badge-changed {
+            border-color: #d97706;
+            background: #fff3dc;
+            color: #9a3412;
+        }
+        .setting-badge-empty {
+            background: #f5f5f4;
+        }
+        .setting-key {
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            font-weight: 700;
+            font-size: 10px;
+        }
+        .setting-value {
+            font-weight: 600;
+        }
+    .throughput-read { background: linear-gradient(90deg, #0f766e, #14b8a6); }
+    .throughput-write { background: linear-gradient(90deg, #b45309, #f59e0b); }
+    .latency-read { background: linear-gradient(90deg, #1d4ed8, #60a5fa); }
+    .latency-write { background: linear-gradient(90deg, #7c3aed, #c084fc); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 13px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    @media (max-width: 900px) {
+      .hero-grid { grid-template-columns: 1fr; }
+      .bar-row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class='hero'>
+      <div class='hero-grid'>
+        <div>
+          <h1>$([System.Net.WebUtility]::HtmlEncode($Title))</h1>
+                    <p>Self-contained HTML report for fio SQL-style benchmarks, with recent comparisons grouped by workload profile and deltas against the previous run in each group.</p>
+          <div class='meta'>
+            <span>Generated: $([System.Net.WebUtility]::HtmlEncode(([DateTime]::UtcNow.ToString('u'))))</span>
+            <span>Results root: $([System.Net.WebUtility]::HtmlEncode([string]$ResultsRoot))</span>
+          </div>
+        </div>
+        <div class='metric-grid'>
+          <div class='card'><div class='metric-label'>Runs</div><div class='metric-value'>$($orderedRuns.Count)</div></div>
+          <div class='card'><div class='metric-label'>Profiles</div><div class='metric-value'>$profileCount</div></div>
+          <div class='card'><div class='metric-label'>SMB Runs</div><div class='metric-value'>$smbRuns</div></div>
+          <div class='card'><div class='metric-label'>Local Runs</div><div class='metric-value'>$localRuns</div></div>
+        </div>
+      </div>
+    </section>
+        <div class='profile-grid'>
+            $($profileSections -join [Environment]::NewLine)
+        </div>
+    <section class='table-card'>
+      <h2>Historical Rollups</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Profile</th>
+            <th>Target Type</th>
+            <th>Target Path</th>
+            <th>Runs</th>
+            <th>Read MB/s Avg</th>
+            <th>Write MB/s Avg</th>
+            <th>Read Mean ms Avg</th>
+            <th>Write Mean ms Avg</th>
+            <th>Last Run</th>
+          </tr>
+        </thead>
+        <tbody>
+          $($rollupTableRows -join [Environment]::NewLine)
+        </tbody>
+      </table>
+    </section>
+    <section class='table-card' style='margin-top: 20px;'>
+      <h2>Runs</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Profile</th>
+            <th>Target Type</th>
+            <th>Target Path</th>
+            <th>Iters</th>
+            <th>Read MB/s</th>
+            <th>Write MB/s</th>
+            <th>Read Mean ms</th>
+            <th>Write Mean ms</th>
+            <th>Result Directory</th>
+          </tr>
+        </thead>
+        <tbody>
+          $($runTableRows -join [Environment]::NewLine)
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
+"@
+
+    $html | Set-Content -Path $Path -Encoding utf8
+}
+
+Export-ModuleMember -Function Resolve-FioSqlBenchTarget, Get-FioSqlBenchProfileDefaults, Merge-FioSqlBenchSettings, New-FioSqlBenchRunContext, New-FioSqlBenchJobContent, Get-FioBenchFilePaths, Test-FioPreparedFiles, Resolve-FioBinary, Invoke-FioSqlBenchRun, ConvertFrom-FioJsonToSummary, Export-FioSqlBenchCsv, Import-FioSqlBenchHistory, Get-FioHistoricalRollup, Export-FioSqlBenchHistoricalCsv, Export-FioSqlBenchHtmlReport, New-FioHtmlProfileComparisonSection, ConvertTo-FioHtmlSettingBadges

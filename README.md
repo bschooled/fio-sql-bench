@@ -9,8 +9,9 @@ Version 1 stays intentionally narrow:
 - File-based tests only
 - Missing target directories are created automatically
 - Local paths, UNC paths, and mapped SMB drives supported
-- Three built-in workload profiles: `Data`, `Log`, `Tempdb`
-- Structured JSON and CSV output per run
+- Five built-in workload profiles: `Data`, `Log`, `Tempdb`, `BackupRestore`, `DbccScan`
+- Structured JSON, CSV, and HTML output per run
+- Historical rollup reporting across multiple result folders
 
 Raw device benchmarking is intentionally blocked to reduce destructive risk.
 
@@ -61,6 +62,27 @@ Default working set: `16 GB` to reduce the chance that results are dominated by 
 - `rwmixread=50`
 - `iodepth=32`
 - `numjobs=8`
+
+### BackupRestore
+
+Approximates large-block backup or restore transfer behavior.
+Default working set: `64 GB` so sequential throughput is measured with a realistic transfer size.
+
+- `rw=rw`
+- `bs=1m`
+- `rwmixread=50`
+- `iodepth=8`
+- `numjobs=2`
+
+### DbccScan
+
+Approximates DBCC-style large-block scan reads.
+Default working set: `32 GB`.
+
+- `rw=read`
+- `bs=256k`
+- `iodepth=8`
+- `numjobs=2`
 
 ## Usage
 
@@ -127,6 +149,37 @@ Override defaults for a custom SQL-like test while still using a built-in profil
   -NumJobs 16
 ```
 
+Dry-run the newer large-block profiles:
+
+```powershell
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath 'D:\SqlBench' `
+  -Profile BackupRestore `
+  -DryRun
+
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath 'D:\SqlBench' `
+  -Profile DbccScan `
+  -DryRun
+```
+
+Build a historical report across existing result folders:
+
+```powershell
+.\scripts\Export-FioSqlBenchReport.ps1 `
+  -ResultsRoot '.\results'
+```
+
+Optionally filter historical output to a subset of runs:
+
+```powershell
+.\scripts\Export-FioSqlBenchReport.ps1 `
+  -ResultsRoot '.\results' `
+  -Profile Data `
+  -TargetType Smb `
+  -Newest 10
+```
+
 ## Output Layout
 
 Each invocation writes results under `results\<timestamp>-<label>\`.
@@ -152,7 +205,14 @@ The script uses Microsoft guidance as its interpretation baseline:
 - `iter-01-summary.json`: normalized summary for that iteration
 - `summary.json`: aggregate wrapper containing all iterations
 - `summary.csv`: flat iteration table for spreadsheets and diffing
+- `summary.html`: self-contained operator report with inline bar charts for throughput and latency
 - `iter-01-console.log`: non-JSON `fio` console output and errors
+
+The historical export script writes these additional artifacts under the chosen results root:
+
+- `historical-summary.json`: aggregated run-level data model across result folders
+- `historical-summary.csv`: flat run-level table for spreadsheets and diffing
+- `historical-report.html`: self-contained historical dashboard with rollup tables and inline charts
 
 The benchmark data files are created under the target directory in a unique subfolder. By default that target subfolder is removed after the run. Use `-NoCleanup` to keep it.
 If a run fails, the target work folder is preserved automatically so the generated files can be inspected.
@@ -179,6 +239,5 @@ If a run fails, the target work folder is preserved automatically so the generat
 These items are not implemented yet:
 
 - Automatic `fio` download and checksum validation
-- Historical run rollup across multiple result folders
-- HTML reporting or charting
-- More SQL profiles such as backup/restore or DBCC-like scans
+- Exporting charts as image files instead of self-contained HTML
+- Additional SQL profiles such as checkpoint, index rebuild, or bulk-load patterns

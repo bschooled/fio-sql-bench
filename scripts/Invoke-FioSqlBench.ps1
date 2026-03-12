@@ -4,8 +4,9 @@ Runs SQL-oriented fio benchmarks against a local directory or SMB share.
 
 .DESCRIPTION
 This script builds a safe, file-based fio job for one of the built-in SQL-like
-profiles (`Data`, `Log`, or `Tempdb`), executes it, and writes raw fio JSON plus
-normalized JSON/CSV summaries under the chosen results directory.
+profiles (`Data`, `Log`, `Tempdb`, `BackupRestore`, or `DbccScan`), executes it,
+and writes raw fio JSON plus normalized JSON/CSV/HTML summaries under the chosen
+results directory.
 
 Use `-DryRun` to inspect the effective settings and generated fio job without
 requiring fio to be installed or any I/O to be executed.
@@ -19,8 +20,10 @@ Forces local or SMB classification. `Auto` infers SMB for UNC paths and local
 for everything else.
 
 .PARAMETER Profile
-Built-in SQL-like fio template to start from. `Data` models random 8K mixed I/O,
-`Log` models sequential log writes, and `Tempdb` models heavier scratch traffic.
+ Built-in SQL-like fio template to start from. `Data` models random 8K mixed I/O,
+ `Log` models sequential log writes, `Tempdb` models heavier scratch traffic,
+ `BackupRestore` models large-block sequential transfer, and `DbccScan` models
+ large-block scan-heavy reads.
 
 .PARAMETER FileSizeGB
 Total file size across all fio workers. The script divides this across `NumJobs`.
@@ -101,7 +104,7 @@ param(
     [string]$TargetType = 'Auto',
 
     [Parameter(ParameterSetName = 'Run')]
-    [ValidateSet('Data', 'Log', 'Tempdb')]
+    [ValidateSet('Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan')]
     [string]$Profile = 'Data',
 
     [Parameter(ParameterSetName = 'Run')]
@@ -376,6 +379,22 @@ function Write-FioSqlInterpretation {
     Write-Host 'SQL latency interpretation' -ForegroundColor Cyan
     Write-FioProperty -Name 'Microsoft rule' -Value 'Sustained 10-15 ms usually warrants SQL I/O investigation.'
     switch ($Profile) {
+        'BackupRestore' {
+            if ($TargetType -eq 'Smb') {
+                Write-FioProperty -Name 'Profile target' -Value 'Backup and restore over SMB should show stable large-block throughput with latency spikes kept out of sustained operation.'
+            }
+            else {
+                Write-FioProperty -Name 'Profile target' -Value 'Backup and restore are throughput-led workloads. Look for strong large-block MB/s without sustained double-digit latency.'
+            }
+        }
+        'DbccScan' {
+            if ($TargetType -eq 'Smb') {
+                Write-FioProperty -Name 'Profile target' -Value 'DBCC-like scans over SMB should maintain predictable sequential read throughput while avoiding sustained tail-latency spikes.'
+            }
+            else {
+                Write-FioProperty -Name 'Profile target' -Value 'DBCC-like scan workloads should keep large-block read latency controlled while favoring consistent throughput.'
+            }
+        }
         'Log' {
             if ($TargetType -eq 'Smb') {
                 Write-FioProperty -Name 'Profile target' -Value 'SMB log writes should still trend toward low single-digit ms; 10-15 ms remains the escalation line.'
@@ -423,6 +442,22 @@ function Get-FioProfileRecommendations {
     $recommendations = New-Object System.Collections.Generic.List[object]
 
     switch ($Profile) {
+        'BackupRestore' {
+            if ($read.BandwidthMBps -ge 250 -and $write.BandwidthMBps -ge 250) {
+                $recommendations.Add([pscustomobject]@{ Color = 'Green'; Text = 'Large-block backup or restore transfer looks healthy. The path is sustaining meaningful sequential throughput in both directions.' })
+            }
+            else {
+                $recommendations.Add([pscustomobject]@{ Color = 'Yellow'; Text = 'Large-block backup or restore throughput is modest. Check network bandwidth, backup target write policy, and whether the storage path is saturating before SQL does.' })
+            }
+        }
+        'DbccScan' {
+            if ($read.MeanMs -le 10 -and $read.BandwidthMBps -ge 150) {
+                $recommendations.Add([pscustomobject]@{ Color = 'Green'; Text = 'DBCC-like scan reads are behaving predictably. This is a reasonable baseline for large sequential inspection workloads.' })
+            }
+            else {
+                $recommendations.Add([pscustomobject]@{ Color = 'Yellow'; Text = 'DBCC-like scan reads show either limited throughput or elevated latency. Review read-ahead efficiency, storage queueing, and any SMB serialization in the path.' })
+            }
+        }
         'Log' {
             if ($write.P99Ms -le 10 -and $write.MeanMs -le 5) {
                 $recommendations.Add([pscustomobject]@{ Color = 'Green'; Text = 'Sequential log-style writes look healthy. This profile is in a range that should not point to WRITELOG pressure by itself.' })
@@ -667,11 +702,13 @@ function Write-FioIterationSummary {
 function Write-FioArtifacts {
     param(
         [string]$SummaryJsonPath,
-        [string]$SummaryCsvPath
+        [string]$SummaryCsvPath,
+        [string]$SummaryHtmlPath
     )
 
     Write-FioProperty -Name 'Summary JSON' -Value $SummaryJsonPath
     Write-FioProperty -Name 'Summary CSV' -Value $SummaryCsvPath
+    Write-FioProperty -Name 'Summary HTML' -Value $SummaryHtmlPath
 }
 
 function Write-FioPreparedFileCheck {
@@ -699,6 +736,7 @@ if ($Help) {
 
 $resolvedTarget = Resolve-FioSqlBenchTarget -TargetPath $TargetPath -TargetType $TargetType
 $profileDefaults = Get-FioSqlBenchProfileDefaults -Profile $Profile
+$Profile = [string]$profileDefaults.ProfileName
 
 $effectiveSettings = Merge-FioSqlBenchSettings `
     -TargetInfo $resolvedTarget `
@@ -885,6 +923,7 @@ if ($iterationSummaries.Count -eq 0) {
 
 $summaryJsonPath = Join-Path -Path $runContext.ResultDirectory -ChildPath 'summary.json'
 $summaryCsvPath = Join-Path -Path $runContext.ResultDirectory -ChildPath 'summary.csv'
+$summaryHtmlPath = Join-Path -Path $runContext.ResultDirectory -ChildPath 'summary.html'
 
 $aggregate = [pscustomobject]@{
     RunId = $runContext.RunId
@@ -898,8 +937,11 @@ $aggregate = [pscustomobject]@{
 $aggregate | ConvertTo-Json -Depth 12 | Set-Content -Path $summaryJsonPath -Encoding utf8
 Export-FioSqlBenchCsv -Summaries $iterationSummaries -Path $summaryCsvPath
 
+$htmlRuns = Import-FioSqlBenchHistory -ResultsRoot $runContext.ResultDirectory
+Export-FioSqlBenchHtmlReport -Runs $htmlRuns -Path $summaryHtmlPath -Title ("fio SQL Bench Run Report - {0}" -f $runContext.RunId) -ResultsRoot $runContext.ResultDirectory
+
 Write-FioStage -Title 'Benchmark finished successfully' -Status 'OK'
-Write-FioArtifacts -SummaryJsonPath $summaryJsonPath -SummaryCsvPath $summaryCsvPath
+Write-FioArtifacts -SummaryJsonPath $summaryJsonPath -SummaryCsvPath $summaryCsvPath -SummaryHtmlPath $summaryHtmlPath
 Write-FioProperty -Name 'Iterations' -Value $iterationSummaries.Count
 Write-FioRollupTable -Summaries $iterationSummaries
 
