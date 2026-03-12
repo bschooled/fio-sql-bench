@@ -53,8 +53,9 @@ Read percentage for mixed workloads (`rwmixread`). Ignored for pure write tests.
 fio `fsync` frequency. The `Log` profile defaults to `1`.
 
 .PARAMETER Direct
-Controls buffered vs direct I/O. `Auto` defaults to direct I/O for local targets
-where the selected profile expects it, and buffered I/O for SMB.
+Controls buffered vs direct I/O. `Auto` defaults to direct I/O for both local
+and SMB targets in the built-in profiles so client-side caching is reduced by
+default.
 
 .PARAMETER OutputRoot
 Root folder where result artifacts are written.
@@ -74,6 +75,11 @@ Preserves the generated `.fio` job file in the results directory.
 
 .PARAMETER NoCleanup
 Preserves the temporary benchmark data files in the target directory.
+
+.PARAMETER ReusePreparedFiles
+Reuses an existing validated prepared-file set for the same profile and fio
+settings under the target path. This can drastically reduce repeated test time,
+especially for SMB targets, at the cost of keeping a persistent prep cache.
 
 .PARAMETER DryRun
 Generates settings and job content without requiring fio or touching the target.
@@ -143,6 +149,8 @@ param(
     [Parameter(ParameterSetName = 'Run')]
     [switch]$NoCleanup,
     [Parameter(ParameterSetName = 'Run')]
+    [switch]$ReusePreparedFiles,
+    [Parameter(ParameterSetName = 'Run')]
     [switch]$DryRun,
     [Parameter(ParameterSetName = 'Run')]
     [switch]$PassThru,
@@ -197,6 +205,207 @@ function Write-FioProperty {
     Write-Host ("  {0,-20} : {1}" -f $Name, $display) -ForegroundColor Gray
 }
 
+function Format-FioBoolean {
+    param(
+        [AllowNull()][object]$Value
+    )
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return '-'
+    }
+
+    if ([bool]$Value) {
+        return 'Yes'
+    }
+
+    return 'No'
+}
+
+function Write-FioSmbReport {
+    param(
+        [pscustomobject]$SmbMetadata,
+        [int]$Direct
+    )
+
+    if ($null -eq $SmbMetadata) {
+        return
+    }
+
+    Write-FioProperty -Name 'SMB server' -Value $SmbMetadata.ServerName
+    Write-FioProperty -Name 'SMB share' -Value $SmbMetadata.ShareName
+    Write-FioProperty -Name 'SMB dialect' -Value $SmbMetadata.Dialect
+    Write-FioProperty -Name 'SMB user' -Value $SmbMetadata.Credential
+    Write-FioProperty -Name 'SMB opens' -Value $SmbMetadata.NumOpens
+    Write-FioProperty -Name 'SMB CA share' -Value (Format-FioBoolean -Value $SmbMetadata.ContinuouslyAvailable)
+    Write-FioProperty -Name 'SMB encrypted' -Value (Format-FioBoolean -Value $SmbMetadata.EncryptData)
+    Write-FioProperty -Name 'SMB channels' -Value $SmbMetadata.MultichannelPathCount
+    Write-FioProperty -Name 'SMB RDMA paths' -Value $SmbMetadata.RdmaPathCount
+
+    Write-Host 'SMB path assessment' -ForegroundColor Cyan
+
+    if ($Direct -eq 1) {
+        Write-Host '  - Direct I/O is enabled, so this run is reducing client-side cache effects by default.' -ForegroundColor Green
+    }
+    else {
+        Write-Host '  - Buffered I/O is enabled. SMB client cache can inflate reads and mixed workloads.' -ForegroundColor Yellow
+    }
+
+    if ($SmbMetadata.Dialect) {
+        if ([string]$SmbMetadata.Dialect -like '3*') {
+            Write-Host ('  - SMB {0} is active. That is the expected protocol family for modern SQL-over-SMB testing.' -f $SmbMetadata.Dialect) -ForegroundColor Green
+        }
+        else {
+            Write-Host ('  - SMB dialect {0} is older than SMB 3.x. Treat results carefully if you are comparing against Microsoft SQL-over-SMB guidance.' -f $SmbMetadata.Dialect) -ForegroundColor Yellow
+        }
+    }
+
+    if ($null -ne $SmbMetadata.MultichannelPathCount) {
+        if ([int]$SmbMetadata.MultichannelPathCount -gt 1) {
+            Write-Host ('  - {0} SMB channels are active to this server. Multichannel is contributing to the path.' -f $SmbMetadata.MultichannelPathCount) -ForegroundColor Green
+        }
+        elseif ([int]$SmbMetadata.MultichannelPathCount -eq 1) {
+            Write-Host '  - Only one active SMB channel was visible. Network redundancy or throughput scaling may be limited.' -ForegroundColor Yellow
+        }
+    }
+
+    if ($null -ne $SmbMetadata.RdmaPathCount) {
+        if ([int]$SmbMetadata.RdmaPathCount -gt 0) {
+            Write-Host ('  - {0} RDMA-capable SMB path(s) were detected. SMB Direct is available on at least part of the route.' -f $SmbMetadata.RdmaPathCount) -ForegroundColor Green
+        }
+        else {
+            Write-Host '  - No RDMA-capable SMB paths were detected. Expect more CPU and latency overhead than an SMB Direct path.' -ForegroundColor DarkYellow
+        }
+    }
+
+    if ($null -ne $SmbMetadata.ContinuouslyAvailable -and -not [bool]$SmbMetadata.ContinuouslyAvailable) {
+        Write-Host '  - The share does not report continuous availability. That may matter if you are using this result as a SQL HA storage baseline.' -ForegroundColor DarkYellow
+    }
+}
+
+function Format-FioByteCount {
+    param(
+        [AllowNull()][double]$Bytes
+    )
+
+    if ($null -eq $Bytes -or $Bytes -lt 0) {
+        return '-'
+    }
+
+    if ($Bytes -ge 1TB) { return ('{0:N2} TB' -f ($Bytes / 1TB)) }
+    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N2} MB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N2} KB' -f ($Bytes / 1KB)) }
+    return ('{0:N0} B' -f $Bytes)
+}
+
+function Get-FioPhysicalMemoryBytes {
+    try {
+        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if ($null -ne $computerSystem.TotalPhysicalMemory) {
+            return [double]$computerSystem.TotalPhysicalMemory
+        }
+    }
+    catch {
+    }
+
+    try {
+        return [double]([Microsoft.VisualBasic.Devices.ComputerInfo]::new().TotalPhysicalMemory)
+    }
+    catch {
+    }
+
+    return $null
+}
+
+function Get-FioCacheBypassAssessment {
+    param(
+        [string]$TargetType,
+        [pscustomobject]$Settings,
+        [AllowNull()][double]$PhysicalMemoryBytes
+    )
+
+    $messages = New-Object System.Collections.Generic.List[object]
+    $riskLevel = 'Low'
+    $cacheMode = if ($Settings.Direct -eq 1) { 'Direct I/O' } else { 'Buffered I/O' }
+
+    if ($TargetType -eq 'Local') {
+        if ($Settings.Direct -eq 1) {
+            $messages.Add([pscustomobject]@{ Color = 'Green'; Text = 'Local direct I/O is enabled. With fio windowsaio this requests FILE_FLAG_NO_BUFFERING, which bypasses the Windows file cache.' })
+        }
+        else {
+            $riskLevel = 'High'
+            $messages.Add([pscustomobject]@{ Color = 'Yellow'; Text = 'Local buffered I/O is enabled. The Windows file cache can materially inflate read and mixed-workload results.' })
+        }
+    }
+    else {
+        if ($Settings.Direct -eq 1) {
+            $riskLevel = 'Medium'
+            $messages.Add([pscustomobject]@{ Color = 'Cyan'; Text = 'Direct I/O was requested for SMB. This reduces client-side caching risk if the path honors it, but server-side and storage-side cache can still influence results.' })
+        }
+        else {
+            $riskLevel = 'High'
+            $messages.Add([pscustomobject]@{ Color = 'Yellow'; Text = 'Buffered SMB I/O is enabled. Client cache, server cache, and storage cache can all inflate results.' })
+        }
+    }
+
+    if ($null -ne $PhysicalMemoryBytes) {
+        if ($Settings.Direct -eq 0 -and $Settings.TotalFileBytes -lt $PhysicalMemoryBytes) {
+            $riskLevel = 'High'
+            $messages.Add([pscustomobject]@{ Color = 'Yellow'; Text = ('Working set {0} is smaller than physical RAM {1}. Buffered runs at this size are very likely to be memory-cached.' -f (Format-FioByteCount -Bytes $Settings.TotalFileBytes), (Format-FioByteCount -Bytes $PhysicalMemoryBytes)) })
+        }
+    }
+
+    if ($Settings.TotalFileBytes -lt 4GB) {
+        if ($riskLevel -eq 'Low') {
+            $riskLevel = 'Medium'
+        }
+        $messages.Add([pscustomobject]@{ Color = 'Yellow'; Text = ('Working set {0} is very small for storage benchmarking. Even with direct I/O, device, controller, or SMB-server cache can overstate performance.' -f (Format-FioByteCount -Bytes $Settings.TotalFileBytes)) })
+    }
+
+    $recommendedMinimumBytes = $null
+    if ($null -ne $PhysicalMemoryBytes -and $Settings.Direct -eq 0) {
+        $recommendedMinimumBytes = [math]::Max([double](4GB), [double]([math]::Ceiling(($PhysicalMemoryBytes * 1.25) / 1GB) * 1GB))
+    }
+    elseif ($Settings.TotalFileBytes -lt 4GB) {
+        $recommendedMinimumBytes = [double](4GB)
+    }
+
+    $messages.Add([pscustomobject]@{ Color = 'DarkGray'; Text = 'fio can bypass the Windows page cache here, but it cannot generically bypass controller DRAM, SSD firmware cache, RAID cache, or remote SMB server cache for file-based workloads.' })
+
+    [pscustomobject]@{
+        CacheMode = $cacheMode
+        RiskLevel = $riskLevel
+        PhysicalMemoryBytes = $PhysicalMemoryBytes
+        RecommendedMinimumBytes = $recommendedMinimumBytes
+        Messages = $messages
+    }
+}
+
+function Write-FioCacheAssessment {
+    param(
+        [pscustomobject]$Assessment
+    )
+
+    $status = switch ($Assessment.RiskLevel) {
+        'High' { 'WARN' }
+        'Medium' { 'WARN' }
+        default { 'OK' }
+    }
+
+    Write-FioStage -Title 'Cache-bypass assessment' -Status $status
+    Write-FioProperty -Name 'Cache mode' -Value $Assessment.CacheMode
+    if ($null -ne $Assessment.PhysicalMemoryBytes) {
+        Write-FioProperty -Name 'Physical RAM' -Value (Format-FioByteCount -Bytes $Assessment.PhysicalMemoryBytes)
+    }
+    if ($null -ne $Assessment.RecommendedMinimumBytes) {
+        Write-FioProperty -Name 'Suggested size' -Value (Format-FioByteCount -Bytes $Assessment.RecommendedMinimumBytes)
+    }
+
+    foreach ($message in $Assessment.Messages) {
+        Write-Host ("  - {0}" -f $message.Text) -ForegroundColor $message.Color
+    }
+}
+
 function Convert-FioUsToMs {
     param(
         [AllowNull()][double]$Microseconds
@@ -248,7 +457,10 @@ function Get-FioSqlProfileAssessment {
         [string]$TargetType,
         [string]$Operation,
         [AllowNull()][double]$MeanLatencyMs,
-        [AllowNull()][double]$P99LatencyMs
+        [AllowNull()][double]$P99LatencyMs,
+        [AllowNull()][double]$P999LatencyMs,
+        [AllowNull()][double]$WorstP99LatencyMs,
+        [int]$Direct
     )
 
     $notes = New-Object System.Collections.Generic.List[string]
@@ -271,6 +483,10 @@ function Get-FioSqlProfileAssessment {
                 elseif ($MeanLatencyMs -le 15) { $status = 'Poor' }
                 else { $status = 'Bad' }
                 $notes.Add('SQL log guidance: well-tuned log writes are typically 1-5 ms, ideally near 1 ms.')
+
+                if ($TargetType -eq 'Local' -and $Direct -eq 0) {
+                    $notes.Add('Local log benchmarking is most SQL-like with direct I/O enabled so buffered filesystem cache does not hide commit latency.')
+                }
             }
         }
         default {
@@ -307,6 +523,25 @@ function Get-FioSqlProfileAssessment {
         }
     }
 
+    if ($null -ne $P999LatencyMs) {
+        if ($Profile -eq 'Log' -and $Operation -eq 'Write' -and $P999LatencyMs -gt 25) {
+            $status = if ($TargetType -eq 'Smb') { 'Poor' } else { 'Bad' }
+            $notes.Add('P99.9 latency shows severe commit stalls. This is a strong SQL log tail-latency warning sign.')
+        }
+        elseif ($P999LatencyMs -gt 30) {
+            $current = Get-FioAssessmentVisual -Status $status
+            $tail = Get-FioAssessmentVisual -Status 'Watch'
+            if ($tail.Rank -gt $current.Rank) {
+                $status = 'Watch'
+            }
+            $notes.Add('P99.9 latency indicates deeper tail stalls beyond the P99 view. Treat this as a stability risk for SQL workloads.')
+        }
+    }
+
+    if ($null -ne $WorstP99LatencyMs -and $null -ne $P99LatencyMs -and $WorstP99LatencyMs -gt ($P99LatencyMs * 1.5)) {
+        $notes.Add('One fio worker is materially worse than the composite tail. This suggests queue imbalance or uneven latency across the path.')
+    }
+
     [pscustomobject]@{
         Status = $status
         Color = (Get-FioAssessmentVisual -Status $status).Color
@@ -319,13 +554,16 @@ function Get-FioOperationRenderModel {
         [string]$Profile,
         [string]$TargetType,
         [string]$Operation,
-        [pscustomobject]$Stats
+        [pscustomobject]$Stats,
+        [int]$Direct
     )
 
     $meanMs = Convert-FioUsToMs -Microseconds $Stats.MeanLatencyUs
     $p95Ms = Convert-FioUsToMs -Microseconds $Stats.P95LatencyUs
     $p99Ms = Convert-FioUsToMs -Microseconds $Stats.P99LatencyUs
-    $assessment = Get-FioSqlProfileAssessment -Profile $Profile -TargetType $TargetType -Operation $Operation -MeanLatencyMs $meanMs -P99LatencyMs $p99Ms
+    $p999Ms = Convert-FioUsToMs -Microseconds $Stats.P999LatencyUs
+    $worstP99Ms = Convert-FioUsToMs -Microseconds $Stats.WorstP99LatencyUs
+    $assessment = Get-FioSqlProfileAssessment -Profile $Profile -TargetType $TargetType -Operation $Operation -MeanLatencyMs $meanMs -P99LatencyMs $p99Ms -P999LatencyMs $p999Ms -WorstP99LatencyMs $worstP99Ms -Direct $Direct
 
     [pscustomobject]@{
         Operation = $Operation
@@ -334,6 +572,11 @@ function Get-FioOperationRenderModel {
         MeanMs = $meanMs
         P95Ms = $p95Ms
         P99Ms = $p99Ms
+        P999Ms = $p999Ms
+        WorstP99Ms = $worstP99Ms
+        TotalIos = $Stats.TotalIos
+        BandwidthCvPercent = $Stats.BandwidthCvPercent
+        IopsCvPercent = $Stats.IopsCvPercent
         Status = $assessment.Status
         Color = $assessment.Color
         Notes = $assessment.Notes
@@ -348,20 +591,20 @@ function Write-FioPerformanceTable {
     )
 
     $rows = @(
-        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Read' -Stats $Summary.Read
-        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Write' -Stats $Summary.Write
+        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Read' -Stats $Summary.Read -Direct $Summary.Direct
+        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Write' -Stats $Summary.Write -Direct $Summary.Direct
     )
 
     Write-Host ''
     Write-Host 'SQL-oriented performance summary' -ForegroundColor Cyan
-    Write-Host ('-' * 100) -ForegroundColor DarkCyan
-    Write-Host ('  {0,-9} {1,12} {2,12} {3,10} {4,10} {5,10} {6,12}' -f 'Operation', 'IOPS', 'MB/s', 'Mean ms', 'P95 ms', 'P99 ms', 'Assessment') -ForegroundColor DarkGray
+    Write-Host ('-' * 114) -ForegroundColor DarkCyan
+    Write-Host ('  {0,-9} {1,12} {2,12} {3,10} {4,10} {5,10} {6,11} {7,12}' -f 'Operation', 'IOPS', 'MB/s', 'Mean ms', 'P95 ms', 'P99 ms', 'P99.9 ms', 'Assessment') -ForegroundColor DarkGray
 
     foreach ($row in $rows) {
-        Write-Host ('  {0,-9} {1,12:N2} {2,12:N2} {3,10:N2} {4,10:N2} {5,10:N2} ' -f $row.Operation, $row.Iops, $row.BandwidthMBps, $row.MeanMs, $row.P95Ms, $row.P99Ms) -NoNewline -ForegroundColor Gray
+        Write-Host ('  {0,-9} {1,12:N2} {2,12:N2} {3,10:N2} {4,10:N2} {5,10:N2} {6,11:N2} ' -f $row.Operation, $row.Iops, $row.BandwidthMBps, $row.MeanMs, $row.P95Ms, $row.P99Ms, $row.P999Ms) -NoNewline -ForegroundColor Gray
         Write-Host ('{0,12}' -f $row.Status) -ForegroundColor $row.Color
     }
-    Write-Host ('-' * 100) -ForegroundColor DarkCyan
+    Write-Host ('-' * 114) -ForegroundColor DarkCyan
 }
 
 function Write-FioSqlInterpretation {
@@ -372,8 +615,8 @@ function Write-FioSqlInterpretation {
     )
 
     $rows = @(
-        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Read' -Stats $Summary.Read
-        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Write' -Stats $Summary.Write
+        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Read' -Stats $Summary.Read -Direct $Summary.Direct
+        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Write' -Stats $Summary.Write -Direct $Summary.Direct
     )
 
     Write-Host 'SQL latency interpretation' -ForegroundColor Cyan
@@ -422,6 +665,13 @@ function Write-FioSqlInterpretation {
         Write-Host ("  {0}" -f $row.Operation) -ForegroundColor $row.Color
         Write-FioProperty -Name 'Mean latency' -Value ("{0:N2} ms" -f $row.MeanMs)
         Write-FioProperty -Name 'P99 latency' -Value ("{0:N2} ms" -f $row.P99Ms)
+        Write-FioProperty -Name 'P99.9 latency' -Value ("{0:N2} ms" -f $row.P999Ms)
+        if ($null -ne $row.WorstP99Ms) {
+            Write-FioProperty -Name 'Worst job P99' -Value ("{0:N2} ms" -f $row.WorstP99Ms)
+        }
+        if ($null -ne $row.BandwidthCvPercent) {
+            Write-FioProperty -Name 'BW stability' -Value ("CV {0:N2}%" -f $row.BandwidthCvPercent)
+        }
         Write-FioProperty -Name 'Assessment' -Value $row.Status
         foreach ($note in $row.Notes | Select-Object -Unique) {
             Write-Host ("    - {0}" -f $note) -ForegroundColor DarkGray
@@ -436,22 +686,24 @@ function Get-FioProfileRecommendations {
         [pscustomobject]$Summary
     )
 
-    $read = Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Read' -Stats $Summary.Read
-    $write = Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Write' -Stats $Summary.Write
+    $read = Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Read' -Stats $Summary.Read -Direct $Summary.Direct
+    $write = Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Write' -Stats $Summary.Write -Direct $Summary.Direct
 
     $recommendations = New-Object System.Collections.Generic.List[object]
 
     switch ($Profile) {
         'BackupRestore' {
-            if ($read.BandwidthMBps -ge 250 -and $write.BandwidthMBps -ge 250) {
+            $readBandwidthCv = if ($null -ne $read.BandwidthCvPercent) { $read.BandwidthCvPercent } else { 0 }
+            $writeBandwidthCv = if ($null -ne $write.BandwidthCvPercent) { $write.BandwidthCvPercent } else { 0 }
+            if ($read.BandwidthMBps -ge 250 -and $write.BandwidthMBps -ge 250 -and $readBandwidthCv -le 20 -and $writeBandwidthCv -le 20) {
                 $recommendations.Add([pscustomobject]@{ Color = 'Green'; Text = 'Large-block backup or restore transfer looks healthy. The path is sustaining meaningful sequential throughput in both directions.' })
             }
             else {
-                $recommendations.Add([pscustomobject]@{ Color = 'Yellow'; Text = 'Large-block backup or restore throughput is modest. Check network bandwidth, backup target write policy, and whether the storage path is saturating before SQL does.' })
+                $recommendations.Add([pscustomobject]@{ Color = 'Yellow'; Text = 'Large-block backup or restore throughput or stability is modest. Check network bandwidth, backup target write policy, and whether the storage path is saturating before SQL does.' })
             }
         }
         'DbccScan' {
-            if ($read.MeanMs -le 10 -and $read.BandwidthMBps -ge 150) {
+            if ($read.MeanMs -le 10 -and $read.P999Ms -le 20 -and $read.BandwidthMBps -ge 150) {
                 $recommendations.Add([pscustomobject]@{ Color = 'Green'; Text = 'DBCC-like scan reads are behaving predictably. This is a reasonable baseline for large sequential inspection workloads.' })
             }
             else {
@@ -459,7 +711,7 @@ function Get-FioProfileRecommendations {
             }
         }
         'Log' {
-            if ($write.P99Ms -le 10 -and $write.MeanMs -le 5) {
+            if ($write.P99Ms -le 10 -and $write.P999Ms -le 20 -and $write.MeanMs -le 5) {
                 $recommendations.Add([pscustomobject]@{ Color = 'Green'; Text = 'Sequential log-style writes look healthy. This profile is in a range that should not point to WRITELOG pressure by itself.' })
             }
             else {
@@ -467,7 +719,7 @@ function Get-FioProfileRecommendations {
             }
         }
         'Tempdb' {
-            if ($read.P99Ms -le 10 -and $write.P99Ms -le 15) {
+            if ($read.P99Ms -le 10 -and $write.P99Ms -le 15 -and $write.P999Ms -le 30) {
                 $recommendations.Add([pscustomobject]@{ Color = 'Green'; Text = 'Tempdb-like random I/O is behaving within a generally healthy SQL range.' })
             }
             else {
@@ -475,13 +727,17 @@ function Get-FioProfileRecommendations {
             }
         }
         default {
-            if ($read.P99Ms -le 10 -and $write.P99Ms -le 15) {
+            if ($read.P99Ms -le 10 -and $write.P99Ms -le 15 -and $write.P999Ms -le 30) {
                 $recommendations.Add([pscustomobject]@{ Color = 'Green'; Text = 'This looks like a solid baseline for OLTP-style data-file behavior. Validate again with a larger working set and longer runtime.' })
             }
             else {
                 $recommendations.Add([pscustomobject]@{ Color = 'Yellow'; Text = 'OLTP-style data behavior shows tail latency risk. Investigate queue depth, background contention, and storage saturation before treating this as production-ready.' })
             }
         }
+    }
+
+    if (($null -ne $read.BandwidthCvPercent -and $read.BandwidthCvPercent -gt 25) -or ($null -ne $write.BandwidthCvPercent -and $write.BandwidthCvPercent -gt 25)) {
+        $recommendations.Add([pscustomobject]@{ Color = 'Yellow'; Text = 'Bandwidth stability is uneven across samples. Re-run at a longer duration and check for throttling, burst behavior, or background contention before treating this as a baseline.' })
     }
 
     if ($TargetType -eq 'Smb') {
@@ -541,10 +797,12 @@ function Write-FioRollupTable {
         @{ Operation = 'Read';  Metric = 'MB/s';    Values = @($Summaries | ForEach-Object { $_.Read.BandwidthMBps }) }
         @{ Operation = 'Read';  Metric = 'Mean ms'; Values = @($Summaries | ForEach-Object { Convert-FioUsToMs -Microseconds $_.Read.MeanLatencyUs }) }
         @{ Operation = 'Read';  Metric = 'P99 ms';  Values = @($Summaries | ForEach-Object { Convert-FioUsToMs -Microseconds $_.Read.P99LatencyUs }) }
+        @{ Operation = 'Read';  Metric = 'P99.9 ms'; Values = @($Summaries | ForEach-Object { Convert-FioUsToMs -Microseconds $_.Read.P999LatencyUs }) }
         @{ Operation = 'Write'; Metric = 'IOPS';    Values = @($Summaries | ForEach-Object { $_.Write.Iops }) }
         @{ Operation = 'Write'; Metric = 'MB/s';    Values = @($Summaries | ForEach-Object { $_.Write.BandwidthMBps }) }
         @{ Operation = 'Write'; Metric = 'Mean ms'; Values = @($Summaries | ForEach-Object { Convert-FioUsToMs -Microseconds $_.Write.MeanLatencyUs }) }
         @{ Operation = 'Write'; Metric = 'P99 ms';  Values = @($Summaries | ForEach-Object { Convert-FioUsToMs -Microseconds $_.Write.P99LatencyUs }) }
+        @{ Operation = 'Write'; Metric = 'P99.9 ms'; Values = @($Summaries | ForEach-Object { Convert-FioUsToMs -Microseconds $_.Write.P999LatencyUs }) }
     )
 
     foreach ($definition in $definitions) {
@@ -571,41 +829,61 @@ function Get-FioAggregateSummary {
     $readIops = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.Iops }
     $readBandwidth = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.BandwidthMBps }
     $readIoMb = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.IoMB }
+    $readTotalIos = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.TotalIos }
     $readMeanLatency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.MeanLatencyUs }
     $readP50Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.P50LatencyUs }
     $readP95Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.P95LatencyUs }
     $readP99Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.P99LatencyUs }
     $readP999Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.P999LatencyUs }
+    $readWorstP99Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.WorstP99LatencyUs }
+    $readWorstP999Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.WorstP999LatencyUs }
+    $readBandwidthCv = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.BandwidthCvPercent }
+    $readIopsCv = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Read.IopsCvPercent }
 
     $writeIops = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.Iops }
     $writeBandwidth = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.BandwidthMBps }
     $writeIoMb = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.IoMB }
+    $writeTotalIos = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.TotalIos }
     $writeMeanLatency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.MeanLatencyUs }
     $writeP50Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.P50LatencyUs }
     $writeP95Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.P95LatencyUs }
     $writeP99Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.P99LatencyUs }
     $writeP999Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.P999LatencyUs }
+    $writeWorstP99Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.WorstP99LatencyUs }
+    $writeWorstP999Latency = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.WorstP999LatencyUs }
+    $writeBandwidthCv = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.BandwidthCvPercent }
+    $writeIopsCv = Get-FioAverageValue -Summaries $Summaries -ValueScript { param($summary) $summary.Write.IopsCvPercent }
 
     $read = [pscustomobject]@{
         Iops = $readIops
         BandwidthMBps = $readBandwidth
         IoMB = $readIoMb
+        TotalIos = $readTotalIos
         MeanLatencyUs = $readMeanLatency
         P50LatencyUs = $readP50Latency
         P95LatencyUs = $readP95Latency
         P99LatencyUs = $readP99Latency
         P999LatencyUs = $readP999Latency
+        WorstP99LatencyUs = $readWorstP99Latency
+        WorstP999LatencyUs = $readWorstP999Latency
+        BandwidthCvPercent = $readBandwidthCv
+        IopsCvPercent = $readIopsCv
     }
 
     $write = [pscustomobject]@{
         Iops = $writeIops
         BandwidthMBps = $writeBandwidth
         IoMB = $writeIoMb
+        TotalIos = $writeTotalIos
         MeanLatencyUs = $writeMeanLatency
         P50LatencyUs = $writeP50Latency
         P95LatencyUs = $writeP95Latency
         P99LatencyUs = $writeP99Latency
         P999LatencyUs = $writeP999Latency
+        WorstP99LatencyUs = $writeWorstP99Latency
+        WorstP999LatencyUs = $writeWorstP999Latency
+        BandwidthCvPercent = $writeBandwidthCv
+        IopsCvPercent = $writeIopsCv
     }
 
     [pscustomobject]@{
@@ -666,6 +944,7 @@ function Write-FioSettingsBlock {
         if ($TargetInfo.SmbMetadata.MappedDrive) {
             Write-FioProperty -Name 'Mapped drive' -Value $TargetInfo.SmbMetadata.MappedDrive
         }
+        Write-FioSmbReport -SmbMetadata $TargetInfo.SmbMetadata -Direct $Settings.Direct
     }
     $targetCreated = if ($TargetInfo.CreatedDirectory) { 'Yes' } else { 'No' }
     Write-FioProperty -Name 'Target created' -Value $targetCreated
@@ -677,7 +956,7 @@ function Write-FioSettingsBlock {
     Write-FioProperty -Name 'Block size' -Value $Settings.BlockSize
     Write-FioProperty -Name 'Queue depth' -Value $Settings.QueueDepth
     Write-FioProperty -Name 'Jobs' -Value $Settings.NumJobs
-    Write-FioProperty -Name 'Direct I/O' -Value $Settings.Direct
+    Write-FioProperty -Name 'Direct I/O' -Value $(if ($Settings.Direct -eq 1) { 'Enabled' } else { 'Disabled' })
     Write-FioProperty -Name 'Total size (GB)' -Value ([math]::Round(($Settings.TotalFileBytes / 1GB), 2))
     if ($null -ne $Settings.ReadMix) {
         Write-FioProperty -Name 'Read mix (%)' -Value $Settings.ReadMix
@@ -726,6 +1005,63 @@ function Write-FioPreparedFileCheck {
     }
 }
 
+function Test-FioPreparationRequired {
+    param(
+        [pscustomobject]$Settings
+    )
+
+    if ($Settings.ReadWrite -eq 'write' -and ($null -eq $Settings.ReadMix -or $Settings.ReadMix -eq 0)) {
+        return $false
+    }
+
+    return $true
+}
+
+function Get-FioPreparationCacheKey {
+    param(
+        [string]$Profile,
+        [string]$TargetType,
+        [pscustomobject]$Settings
+    )
+
+    $seed = [ordered]@{
+        Profile = $Profile
+        TargetType = $TargetType
+        FileSizeGB = $Settings.FileSizeGB
+        BlockSize = $Settings.BlockSize
+        QueueDepth = $Settings.QueueDepth
+        NumJobs = $Settings.NumJobs
+        Direct = $Settings.Direct
+        ReadWrite = $Settings.ReadWrite
+        ReadMix = $Settings.ReadMix
+        Fsync = $Settings.Fsync
+    } | ConvertTo-Json -Compress
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($seed)
+        $hashBytes = $sha.ComputeHash($bytes)
+        return -join ($hashBytes | ForEach-Object { $_.ToString('x2') } | Select-Object -First 8)
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function New-FioExecutionRunContext {
+    param(
+        [pscustomobject]$RunContext,
+        [string]$TargetRunDirectory
+    )
+
+    [pscustomobject]@{
+        RunId = $RunContext.RunId
+        ResultDirectory = $RunContext.ResultDirectory
+        TargetRunDirectory = $TargetRunDirectory
+        TimestampUtc = $RunContext.TimestampUtc
+    }
+}
+
 $modulePath = Join-Path -Path $PSScriptRoot -ChildPath '..\src\FioSqlBench\FioSqlBench.psm1'
 Import-Module -Name $modulePath -Force
 
@@ -759,20 +1095,33 @@ $runContext = New-FioSqlBenchRunContext `
     -Profile $Profile `
     -Settings $effectiveSettings
 
+$physicalMemoryBytes = Get-FioPhysicalMemoryBytes
+$cacheAssessment = Get-FioCacheBypassAssessment -TargetType $resolvedTarget.Type -Settings $effectiveSettings -PhysicalMemoryBytes $physicalMemoryBytes
+
+$targetWorkDirectory = $runContext.TargetRunDirectory
+$preparationCacheKey = $null
+if ($ReusePreparedFiles) {
+    $preparationCacheKey = Get-FioPreparationCacheKey -Profile $Profile -TargetType $resolvedTarget.Type -Settings $effectiveSettings
+    $targetWorkDirectory = Join-Path -Path $resolvedTarget.Path -ChildPath (Join-Path -Path '.fio-sql-bench-cache' -ChildPath ('{0}-{1}' -f $Profile.ToLowerInvariant(), $preparationCacheKey))
+}
+
+$executionRunContext = New-FioExecutionRunContext -RunContext $runContext -TargetRunDirectory $targetWorkDirectory
+
 $prepJobContent = New-FioSqlBenchJobContent `
     -Settings $effectiveSettings `
-    -RunContext $runContext `
+    -RunContext $executionRunContext `
     -Phase Prep
 
 $jobContent = New-FioSqlBenchJobContent `
     -Settings $effectiveSettings `
-    -RunContext $runContext `
+    -RunContext $executionRunContext `
     -Phase Bench `
     -EnableLogs:$EnableLogs
 
 Write-FioConsoleBanner -Title 'fio SQL Bench' -Subtitle 'Windows-first fio harness for SQL-like storage workloads'
 Write-FioStage -Title 'Resolved benchmark plan' -Status 'OK'
 Write-FioSettingsBlock -TargetInfo $resolvedTarget -Settings $effectiveSettings -RunContext $runContext -Profile $Profile
+Write-FioCacheAssessment -Assessment $cacheAssessment
 
 if ($resolvedTarget.CreatedDirectory) {
     Write-FioStage -Title 'Created target directory for benchmark files' -Status 'OK'
@@ -781,7 +1130,10 @@ if ($resolvedTarget.CreatedDirectory) {
 
 if ($DryRun) {
     Write-FioStage -Title 'Dry run complete: generated fio job without executing I/O' -Status 'OK'
-    Write-FioProperty -Name 'Target work dir' -Value $runContext.TargetRunDirectory
+    Write-FioProperty -Name 'Target work dir' -Value $executionRunContext.TargetRunDirectory
+    if ($ReusePreparedFiles) {
+        Write-FioProperty -Name 'Prep cache key' -Value $preparationCacheKey
+    }
     Write-FioProperty -Name 'Prep job preview' -Value (Join-Path -Path $runContext.ResultDirectory -ChildPath 'fio-prep-job.fio')
     Write-FioProperty -Name 'Bench job preview' -Value (Join-Path -Path $runContext.ResultDirectory -ChildPath 'fio-job.fio')
     Write-Host ''
@@ -822,11 +1174,14 @@ Write-FioProperty -Name 'fio path' -Value $fioBinary.Path
 Write-FioProperty -Name 'fio version' -Value $fioBinary.Version
 
 New-Item -ItemType Directory -Path $runContext.ResultDirectory -Force | Out-Null
-New-Item -ItemType Directory -Path $runContext.TargetRunDirectory -Force | Out-Null
+New-Item -ItemType Directory -Path $executionRunContext.TargetRunDirectory -Force | Out-Null
 
 Write-FioStage -Title 'Prepared working directories' -Status 'OK'
 Write-FioProperty -Name 'Results dir' -Value $runContext.ResultDirectory
-Write-FioProperty -Name 'Target work dir' -Value $runContext.TargetRunDirectory
+Write-FioProperty -Name 'Target work dir' -Value $executionRunContext.TargetRunDirectory
+if ($ReusePreparedFiles) {
+    Write-FioProperty -Name 'Prep cache key' -Value $preparationCacheKey
+}
 
 $prepJobFilePath = Join-Path -Path $runContext.ResultDirectory -ChildPath 'fio-prep-job.fio'
 $jobFilePath = Join-Path -Path $runContext.ResultDirectory -ChildPath 'fio-job.fio'
@@ -839,38 +1194,52 @@ Write-FioProperty -Name 'Bench job file' -Value $jobFilePath
 
 $iterationSummaries = New-Object System.Collections.Generic.List[object]
 $runSucceeded = $false
+$preparedFiles = Get-FioBenchFilePaths -Settings $effectiveSettings -RunContext $executionRunContext
+$prepRequired = Test-FioPreparationRequired -Settings $effectiveSettings
 
 try {
+    if (-not $PSCmdlet.ShouldProcess($executionRunContext.TargetRunDirectory, "Run fio profile $Profile")) {
+        return
+    }
+
+    if (-not $prepRequired) {
+        Write-FioStage -Title 'Skipped benchmark file preparation for write-only workload' -Status 'OK'
+    }
+    else {
+        $preparedValidation = Test-FioPreparedFiles -Paths $preparedFiles -ExpectedLengthBytes $effectiveSettings.FileSizePerJobBytes
+        $canReusePreparedFiles = $ReusePreparedFiles -and $preparedValidation.AllValid
+
+        if ($canReusePreparedFiles) {
+            Write-FioStage -Title 'Reusing validated prepared benchmark files' -Status 'OK'
+            Write-FioProperty -Name 'Prepared file set' -Value $executionRunContext.TargetRunDirectory
+        }
+        else {
+            $prepJsonPath = Join-Path -Path $runContext.ResultDirectory -ChildPath 'iter-01-prep-fio.json'
+            $prepConsolePath = Join-Path -Path $runContext.ResultDirectory -ChildPath 'iter-01-prep-console.log'
+
+            Write-FioStage -Title 'Preparing benchmark files once before timed iterations' -Status 'RUN'
+            Write-FioProperty -Name 'Prep JSON output' -Value $prepJsonPath
+            Write-FioProperty -Name 'Prep console log' -Value $prepConsolePath
+
+            Invoke-FioSqlBenchRun `
+                -FioPath $fioBinary.Path `
+                -JobFilePath $prepJobFilePath `
+                -OutputJsonPath $prepJsonPath `
+                -ConsoleLogPath $prepConsolePath | Out-Null
+
+            $preparedValidation = Test-FioPreparedFiles -Paths $preparedFiles -ExpectedLengthBytes $effectiveSettings.FileSizePerJobBytes
+            if (-not $preparedValidation.AllValid) {
+                Write-FioStage -Title 'Prepared benchmark files did not reach the expected size' -Status 'WARN'
+                Write-FioPreparedFileCheck -Validation $preparedValidation
+                throw "Prepared benchmark files on '$($resolvedTarget.Path)' are smaller than expected. See $prepConsolePath for prep details."
+            }
+        }
+    }
+
     for ($iteration = 1; $iteration -le $effectiveSettings.Iterations; $iteration++) {
         $iterationPrefix = 'iter-{0:D2}' -f $iteration
         $iterationJsonPath = Join-Path -Path $runContext.ResultDirectory -ChildPath ("$iterationPrefix-fio.json")
         $iterationConsolePath = Join-Path -Path $runContext.ResultDirectory -ChildPath ("$iterationPrefix-console.log")
-
-        if (-not $PSCmdlet.ShouldProcess($runContext.TargetRunDirectory, "Run fio iteration $iteration for profile $Profile")) {
-            continue
-        }
-
-        $prepJsonPath = Join-Path -Path $runContext.ResultDirectory -ChildPath ("$iterationPrefix-prep-fio.json")
-        $prepConsolePath = Join-Path -Path $runContext.ResultDirectory -ChildPath ("$iterationPrefix-prep-console.log")
-
-        Write-FioStage -Title ("Preparing benchmark files for iteration {0} of {1}" -f $iteration, $effectiveSettings.Iterations) -Status 'RUN'
-        Write-FioProperty -Name 'Prep JSON output' -Value $prepJsonPath
-        Write-FioProperty -Name 'Prep console log' -Value $prepConsolePath
-
-        Invoke-FioSqlBenchRun `
-            -FioPath $fioBinary.Path `
-            -JobFilePath $prepJobFilePath `
-            -OutputJsonPath $prepJsonPath `
-            -ConsoleLogPath $prepConsolePath | Out-Null
-
-        $preparedFiles = Get-FioBenchFilePaths -Settings $effectiveSettings -RunContext $runContext
-        $preparedValidation = Test-FioPreparedFiles -Paths $preparedFiles -ExpectedLengthBytes $effectiveSettings.FileSizePerJobBytes
-
-        if (-not $preparedValidation.AllValid) {
-            Write-FioStage -Title 'Prepared benchmark files did not reach the expected size' -Status 'WARN'
-            Write-FioPreparedFileCheck -Validation $preparedValidation
-            throw "Prepared benchmark files on '$($resolvedTarget.Path)' are smaller than expected. See $prepConsolePath for prep details."
-        }
 
         Write-FioStage -Title ("Running fio iteration {0} of {1}" -f $iteration, $effectiveSettings.Iterations) -Status 'RUN'
         Write-FioProperty -Name 'JSON output' -Value $iterationJsonPath
@@ -886,7 +1255,7 @@ try {
 
         $summary = ConvertFrom-FioJsonToSummary `
             -JsonPath $iterationJsonPath `
-            -RunContext $runContext `
+            -RunContext $executionRunContext `
             -Settings $effectiveSettings `
             -Iteration $iteration `
             -FioVersion $fioBinary.Version `
@@ -912,8 +1281,8 @@ finally {
         Remove-Item -Path $jobFilePath -Force
     }
 
-    if (-not $NoCleanup -and $runSucceeded -and (Test-Path -Path $runContext.TargetRunDirectory)) {
-        Remove-Item -Path $runContext.TargetRunDirectory -Recurse -Force
+    if (-not $NoCleanup -and -not $ReusePreparedFiles -and $runSucceeded -and (Test-Path -Path $executionRunContext.TargetRunDirectory)) {
+        Remove-Item -Path $executionRunContext.TargetRunDirectory -Recurse -Force
     }
 }
 

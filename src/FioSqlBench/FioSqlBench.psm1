@@ -15,6 +15,28 @@ function Remove-FioNullPadding {
     return $Value.Replace([string][char]0, '').Trim()
 }
 
+function Get-FioObjectPropertyValue {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Object,
+
+        [Parameter(Mandatory)]
+        [string]$PropertyName
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    $property = $Object.PSObject.Properties[$PropertyName]
+    if ($null -eq $property) {
+        return $null
+    }
+
+    return $property.Value
+}
+
 function Get-FioMappedSmbInfo {
     [CmdletBinding()]
     param(
@@ -143,15 +165,45 @@ function Get-SmbTargetMetadata {
     $server = $segments[0]
     $share = $segments[1]
 
-    $connection = $null
+    $connections = @()
     try {
-        $connection = Get-SmbConnection -ErrorAction Stop | Where-Object {
+        $connections = @(Get-SmbConnection -ErrorAction Stop | Where-Object {
             $_.ServerName -eq $server -and $_.ShareName -eq $share
-        } | Select-Object -First 1
+        })
     }
     catch {
-        $connection = $null
+        $connections = @()
     }
+
+    $connection = $connections | Select-Object -First 1
+    $multichannelConnections = @()
+    try {
+        $multichannelConnections = @(Get-SmbMultichannelConnection -ErrorAction Stop | Where-Object {
+            $_.ServerName -eq $server
+        })
+    }
+    catch {
+        $multichannelConnections = @()
+    }
+
+    $selectedChannels = @($multichannelConnections | Where-Object {
+        $selected = Get-FioObjectPropertyValue -Object $_ -PropertyName 'Selected'
+        $null -eq $selected -or [bool]$selected
+    })
+
+    $rdmaChannels = @($selectedChannels | Where-Object {
+        $clientRdma = Get-FioObjectPropertyValue -Object $_ -PropertyName 'ClientRdmaCapable'
+        if ($null -eq $clientRdma) {
+            $clientRdma = Get-FioObjectPropertyValue -Object $_ -PropertyName 'ClientRDMA Capable'
+        }
+
+        $serverRdma = Get-FioObjectPropertyValue -Object $_ -PropertyName 'ServerRdmaCapable'
+        if ($null -eq $serverRdma) {
+            $serverRdma = Get-FioObjectPropertyValue -Object $_ -PropertyName 'ServerRDMA Capable'
+        }
+
+        [bool]$clientRdma -and [bool]$serverRdma
+    })
 
     [pscustomobject]@{
         ServerName = $server
@@ -161,6 +213,11 @@ function Get-SmbTargetMetadata {
         Credential = if ($connection) { $connection.UserName } else { $null }
         Dialect = if ($connection) { $connection.Dialect } else { $null }
         NumOpens = if ($connection) { $connection.NumOpens } else { $null }
+        EncryptData = if ($connection) { Get-FioObjectPropertyValue -Object $connection -PropertyName 'EncryptData' } else { $null }
+        ContinuouslyAvailable = if ($connection) { Get-FioObjectPropertyValue -Object $connection -PropertyName 'ContinuouslyAvailable' } else { $null }
+        ConnectionCount = $connections.Count
+        MultichannelPathCount = $selectedChannels.Count
+        RdmaPathCount = $rdmaChannels.Count
     }
 }
 
@@ -186,7 +243,7 @@ function Get-FioSqlBenchProfileDefaults {
                 ReadMix = 70
                 Fsync = 0
                 DirectLocal = 1
-                DirectSmb = 0
+                DirectSmb = 1
                 ReadWrite = 'randrw'
             }
         }
@@ -202,8 +259,8 @@ function Get-FioSqlBenchProfileDefaults {
                 BlockSize = '64k'
                 ReadMix = $null
                 Fsync = 1
-                DirectLocal = 0
-                DirectSmb = 0
+                DirectLocal = 1
+                DirectSmb = 1
                 ReadWrite = 'write'
             }
         }
@@ -220,7 +277,7 @@ function Get-FioSqlBenchProfileDefaults {
                 ReadMix = 50
                 Fsync = 0
                 DirectLocal = 1
-                DirectSmb = 0
+                DirectSmb = 1
                 ReadWrite = 'randrw'
             }
         }
@@ -237,7 +294,7 @@ function Get-FioSqlBenchProfileDefaults {
                 ReadMix = 50
                 Fsync = 0
                 DirectLocal = 1
-                DirectSmb = 0
+                DirectSmb = 1
                 ReadWrite = 'rw'
             }
         }
@@ -254,7 +311,7 @@ function Get-FioSqlBenchProfileDefaults {
                 ReadMix = $null
                 Fsync = 0
                 DirectLocal = 1
-                DirectSmb = 0
+                DirectSmb = 1
                 ReadWrite = 'read'
             }
         }
@@ -449,6 +506,7 @@ function New-FioSqlBenchJobContent {
     $lines.Add('randrepeat=0')
     $lines.Add('create_on_open=1')
     $lines.Add('invalidate=1')
+    $lines.Add('refill_buffers=1')
     $lines.Add('percentile_list=50:95:99:99.9')
 
     if ($Phase -ne 'Prep') {
@@ -815,12 +873,28 @@ function Merge-FioOperationStats {
             continue
         }
 
+        $latencyMetric = Get-FioLatencyMetric -Operation $operation
+        $percentiles = if ($null -ne $latencyMetric) { Get-FioLatencyPercentilesUs -Operation $operation } else { $null }
+
         [pscustomobject]@{
             Iops = [double]$operation.iops
             BwBytes = [double]$operation.bw_bytes
             IoBytes = [double]$operation.io_bytes
-            MeanLatencyUs = Get-FioMeanLatencyUs -Operation $operation
-            Percentiles = Get-FioLatencyPercentilesUs -Operation $operation
+            RuntimeMs = [double]$operation.runtime
+            TotalIos = [double]$operation.total_ios
+            BwMinKBps = [double]$operation.bw_min
+            BwMaxKBps = [double]$operation.bw_max
+            BwMeanKBps = [double]$operation.bw_mean
+            BwStdDevKBps = [double]$operation.bw_dev
+            BwSamples = [double]$operation.bw_samples
+            IopsMin = [double]$operation.iops_min
+            IopsMax = [double]$operation.iops_max
+            IopsMean = [double]$operation.iops_mean
+            IopsStdDev = [double]$operation.iops_stddev
+            IopsSamples = [double]$operation.iops_samples
+            LatencySampleCount = if ($null -ne $latencyMetric) { [double]$latencyMetric.SampleCount } else { 0 }
+            MeanLatencyUs = if ($null -ne $latencyMetric) { [math]::Round(($latencyMetric.Mean / $latencyMetric.Divisor), 2) } else { $null }
+            Percentiles = $percentiles
         }
     }
 
@@ -829,26 +903,64 @@ function Merge-FioOperationStats {
             Iops = 0
             BandwidthMBps = 0
             IoMB = 0
+            RuntimeMs = 0
+            TotalIos = 0
+            LatencySampleCount = 0
             MeanLatencyUs = $null
             P50LatencyUs = $null
             P95LatencyUs = $null
             P99LatencyUs = $null
             P999LatencyUs = $null
+            WorstP99LatencyUs = $null
+            WorstP999LatencyUs = $null
+            BandwidthMinMBps = $null
+            BandwidthMaxMBps = $null
+            BandwidthMeanMBps = $null
+            BandwidthStdDevMBps = $null
+            BandwidthCvPercent = $null
+            IopsMin = $null
+            IopsMax = $null
+            IopsMean = $null
+            IopsStdDev = $null
+            IopsCvPercent = $null
         }
     }
 
     $validLatency = @($opStats | Where-Object { $null -ne $_.MeanLatencyUs })
     $percentileStats = @($opStats | Where-Object { $null -ne $_.Percentiles })
+    $weightedLatencyStats = @($validLatency | Where-Object { $_.LatencySampleCount -gt 0 })
+    $weightedBwStats = @($opStats | Where-Object { $_.BwSamples -gt 0 })
+    $weightedIopsStats = @($opStats | Where-Object { $_.IopsSamples -gt 0 })
+
+    $bandwidthMeanMBps = Get-FioWeightedAverage -Items $weightedBwStats -ValueProperty 'BwMeanKBps' -WeightProperty 'BwSamples' -Divisor 1024.0
+    $bandwidthStdDevMBps = Get-FioWeightedAverage -Items $weightedBwStats -ValueProperty 'BwStdDevKBps' -WeightProperty 'BwSamples' -Divisor 1024.0
+    $iopsMean = Get-FioWeightedAverage -Items $weightedIopsStats -ValueProperty 'IopsMean' -WeightProperty 'IopsSamples'
+    $iopsStdDev = Get-FioWeightedAverage -Items $weightedIopsStats -ValueProperty 'IopsStdDev' -WeightProperty 'IopsSamples'
 
     [pscustomobject]@{
         Iops = [math]::Round((($opStats | Measure-Object -Property Iops -Sum).Sum), 2)
         BandwidthMBps = [math]::Round((((($opStats | Measure-Object -Property BwBytes -Sum).Sum) / 1MB)), 2)
         IoMB = [math]::Round((((($opStats | Measure-Object -Property IoBytes -Sum).Sum) / 1MB)), 2)
-        MeanLatencyUs = if ($validLatency.Count -gt 0) { [math]::Round((($validLatency | Measure-Object -Property MeanLatencyUs -Average).Average), 2) } else { $null }
-        P50LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P50'
-        P95LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P95'
-        P99LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P99'
-        P999LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P999'
+        RuntimeMs = [math]::Round((($opStats | Measure-Object -Property RuntimeMs -Maximum).Maximum), 2)
+        TotalIos = [math]::Round((($opStats | Measure-Object -Property TotalIos -Sum).Sum), 2)
+        LatencySampleCount = [math]::Round((($opStats | Measure-Object -Property LatencySampleCount -Sum).Sum), 2)
+        MeanLatencyUs = Get-FioWeightedAverage -Items $weightedLatencyStats -ValueProperty 'MeanLatencyUs' -WeightProperty 'LatencySampleCount'
+        P50LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P50' -Mode 'WeightedAverage'
+        P95LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P95' -Mode 'WeightedAverage'
+        P99LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P99' -Mode 'WeightedAverage'
+        P999LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P999' -Mode 'WeightedAverage'
+        WorstP99LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P99' -Mode 'Maximum'
+        WorstP999LatencyUs = Get-AggregatedPercentile -Stats $percentileStats -Name 'P999' -Mode 'Maximum'
+        BandwidthMinMBps = [math]::Round((((($opStats | Measure-Object -Property BwMinKBps -Minimum).Minimum) / 1024.0)), 2)
+        BandwidthMaxMBps = [math]::Round((((($opStats | Measure-Object -Property BwMaxKBps -Maximum).Maximum) / 1024.0)), 2)
+        BandwidthMeanMBps = $bandwidthMeanMBps
+        BandwidthStdDevMBps = $bandwidthStdDevMBps
+        BandwidthCvPercent = Get-FioCoefficientOfVariation -Mean $bandwidthMeanMBps -StdDev $bandwidthStdDevMBps
+        IopsMin = [math]::Round((($opStats | Measure-Object -Property IopsMin -Minimum).Minimum), 2)
+        IopsMax = [math]::Round((($opStats | Measure-Object -Property IopsMax -Maximum).Maximum), 2)
+        IopsMean = $iopsMean
+        IopsStdDev = $iopsStdDev
+        IopsCvPercent = Get-FioCoefficientOfVariation -Mean $iopsMean -StdDev $iopsStdDev
     }
 }
 
@@ -858,7 +970,10 @@ function Get-AggregatedPercentile {
         [object[]]$Stats,
 
         [Parameter(Mandatory)]
-        [string]$Name
+        [string]$Name,
+
+        [ValidateSet('Maximum', 'WeightedAverage')]
+        [string]$Mode = 'Maximum'
     )
 
     if ($null -eq $Stats -or $Stats.Count -eq 0) {
@@ -870,7 +985,98 @@ function Get-AggregatedPercentile {
         return $null
     }
 
+    if ($Mode -eq 'WeightedAverage') {
+        return Get-FioWeightedAverage -Items @($Stats | Where-Object { $null -ne $_.Percentiles.$Name -and $_.LatencySampleCount -gt 0 }) -ValueProperty ("Percentiles.$Name") -WeightProperty 'LatencySampleCount'
+    }
+
     [math]::Round((($values | Measure-Object -Maximum).Maximum), 2)
+}
+
+function Get-FioWeightedAverage {
+    [CmdletBinding()]
+    param(
+        [object[]]$Items,
+
+        [Parameter(Mandatory)]
+        [string]$ValueProperty,
+
+        [Parameter(Mandatory)]
+        [string]$WeightProperty,
+
+        [double]$Divisor = 1.0
+    )
+
+    if ($null -eq $Items -or $Items.Count -eq 0) {
+        return $null
+    }
+
+    $weightedSum = 0.0
+    $weightTotal = 0.0
+    foreach ($item in $Items) {
+        $value = Get-FioNestedPropertyValue -Object $item -Path $ValueProperty
+        $weight = Get-FioNestedPropertyValue -Object $item -Path $WeightProperty
+        if ($null -eq $value -or $null -eq $weight) {
+            continue
+        }
+
+        $numericWeight = [double]$weight
+        if ($numericWeight -le 0) {
+            continue
+        }
+
+        $weightedSum += ([double]$value * $numericWeight)
+        $weightTotal += $numericWeight
+    }
+
+    if ($weightTotal -le 0) {
+        return $null
+    }
+
+    return [math]::Round((($weightedSum / $weightTotal) / $Divisor), 2)
+}
+
+function Get-FioNestedPropertyValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Object,
+
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $current = $Object
+    foreach ($segment in $Path.Split('.')) {
+        if ($null -eq $current) {
+            return $null
+        }
+
+        $property = $current.PSObject.Properties[$segment]
+        if (-not $property) {
+            return $null
+        }
+
+        $current = $property.Value
+    }
+
+    return $current
+}
+
+function Get-FioCoefficientOfVariation {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [double]$Mean,
+
+        [AllowNull()]
+        [double]$StdDev
+    )
+
+    if ($null -eq $Mean -or $null -eq $StdDev -or $Mean -eq 0) {
+        return $null
+    }
+
+    return [math]::Round((($StdDev / $Mean) * 100.0), 2)
 }
 
 function Get-FioMeanLatencyUs {
@@ -942,6 +1148,7 @@ function Get-FioLatencyMetric {
             Source = $property.Value
             Mean = [double]$meanProperty.Value
             Divisor = $candidate.Divisor
+            SampleCount = if ($property.Value.PSObject.Properties['N']) { [double]$property.Value.N } else { [double]$Operation.total_ios }
         }
     }
 
@@ -988,6 +1195,13 @@ function Export-FioSqlBenchCsv {
             Iteration = $summary.Iteration
             TargetPath = $summary.TargetPath
             TargetType = $summary.TargetType
+            SmbServerName = if ($summary.SmbMetadata) { $summary.SmbMetadata.ServerName } else { $null }
+            SmbShareName = if ($summary.SmbMetadata) { $summary.SmbMetadata.ShareName } else { $null }
+            SmbDialect = if ($summary.SmbMetadata) { $summary.SmbMetadata.Dialect } else { $null }
+            SmbContinuouslyAvailable = if ($summary.SmbMetadata) { $summary.SmbMetadata.ContinuouslyAvailable } else { $null }
+            SmbEncryptData = if ($summary.SmbMetadata) { $summary.SmbMetadata.EncryptData } else { $null }
+            SmbMultichannelPathCount = if ($summary.SmbMetadata) { $summary.SmbMetadata.MultichannelPathCount } else { $null }
+            SmbRdmaPathCount = if ($summary.SmbMetadata) { $summary.SmbMetadata.RdmaPathCount } else { $null }
             FioVersion = $summary.FioVersion
             RuntimeSec = $summary.RuntimeSec
             FileSizeGB = $summary.FileSizeGB
@@ -1005,6 +1219,9 @@ function Export-FioSqlBenchCsv {
             ReadP95LatencyUs = $summary.Read.P95LatencyUs
             ReadP99LatencyUs = $summary.Read.P99LatencyUs
             ReadP999LatencyUs = $summary.Read.P999LatencyUs
+            ReadWorstP99LatencyUs = $summary.Read.WorstP99LatencyUs
+            ReadWorstP999LatencyUs = $summary.Read.WorstP999LatencyUs
+            ReadBandwidthCvPercent = $summary.Read.BandwidthCvPercent
             WriteIops = $summary.Write.Iops
             WriteBandwidthMBps = $summary.Write.BandwidthMBps
             WriteMeanLatencyUs = $summary.Write.MeanLatencyUs
@@ -1012,6 +1229,9 @@ function Export-FioSqlBenchCsv {
             WriteP95LatencyUs = $summary.Write.P95LatencyUs
             WriteP99LatencyUs = $summary.Write.P99LatencyUs
             WriteP999LatencyUs = $summary.Write.P999LatencyUs
+            WriteWorstP99LatencyUs = $summary.Write.WorstP99LatencyUs
+            WriteWorstP999LatencyUs = $summary.Write.WorstP999LatencyUs
+            WriteBandwidthCvPercent = $summary.Write.BandwidthCvPercent
         }
     }
 
@@ -1030,7 +1250,13 @@ function Get-FioHistoricalAverageValue {
 
     $values = @(
         foreach ($item in $Items) {
-            $value = & $ValueScript $item
+            try {
+                $value = & $ValueScript $item
+            }
+            catch {
+                $value = $null
+            }
+
             if ($null -ne $value) {
                 [double]$value
             }
@@ -1129,6 +1355,9 @@ function Get-FioHistoryRunAggregate {
         P95LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.P95LatencyUs }
         P99LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.P99LatencyUs }
         P999LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.P999LatencyUs }
+        WorstP99LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.WorstP99LatencyUs }
+        WorstP999LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.WorstP999LatencyUs }
+        BandwidthCvPercent = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.BandwidthCvPercent }
     }
 
     $write = [pscustomobject]@{
@@ -1140,6 +1369,9 @@ function Get-FioHistoryRunAggregate {
         P95LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.P95LatencyUs }
         P99LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.P99LatencyUs }
         P999LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.P999LatencyUs }
+        WorstP99LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.WorstP99LatencyUs }
+        WorstP999LatencyUs = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.WorstP999LatencyUs }
+        BandwidthCvPercent = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Write.BandwidthCvPercent }
     }
 
     return [pscustomobject]@{
@@ -1288,6 +1520,13 @@ function Export-FioSqlBenchHistoricalCsv {
             ResultDirectory = $run.ResultDirectory
             TargetPath = $run.TargetPath
             TargetType = $run.TargetType
+            SmbServerName = if ($run.SmbMetadata) { $run.SmbMetadata.ServerName } else { $null }
+            SmbShareName = if ($run.SmbMetadata) { $run.SmbMetadata.ShareName } else { $null }
+            SmbDialect = if ($run.SmbMetadata) { $run.SmbMetadata.Dialect } else { $null }
+            SmbContinuouslyAvailable = if ($run.SmbMetadata) { $run.SmbMetadata.ContinuouslyAvailable } else { $null }
+            SmbEncryptData = if ($run.SmbMetadata) { $run.SmbMetadata.EncryptData } else { $null }
+            SmbMultichannelPathCount = if ($run.SmbMetadata) { $run.SmbMetadata.MultichannelPathCount } else { $null }
+            SmbRdmaPathCount = if ($run.SmbMetadata) { $run.SmbMetadata.RdmaPathCount } else { $null }
             IterationCount = $run.IterationCount
             FioVersion = $run.FioVersion
             RuntimeSec = $run.RuntimeSec
@@ -1305,11 +1544,19 @@ function Export-FioSqlBenchHistoricalCsv {
             ReadMeanLatencyUs = $run.Read.MeanLatencyUs
             ReadP95LatencyUs = $run.Read.P95LatencyUs
             ReadP99LatencyUs = $run.Read.P99LatencyUs
+            ReadP999LatencyUs = $run.Read.P999LatencyUs
+            ReadWorstP99LatencyUs = $run.Read.WorstP99LatencyUs
+            ReadWorstP999LatencyUs = $run.Read.WorstP999LatencyUs
+            ReadBandwidthCvPercent = $run.Read.BandwidthCvPercent
             WriteIops = $run.Write.Iops
             WriteBandwidthMBps = $run.Write.BandwidthMBps
             WriteMeanLatencyUs = $run.Write.MeanLatencyUs
             WriteP95LatencyUs = $run.Write.P95LatencyUs
             WriteP99LatencyUs = $run.Write.P99LatencyUs
+            WriteP999LatencyUs = $run.Write.P999LatencyUs
+            WriteWorstP99LatencyUs = $run.Write.WorstP99LatencyUs
+            WriteWorstP999LatencyUs = $run.Write.WorstP999LatencyUs
+            WriteBandwidthCvPercent = $run.Write.BandwidthCvPercent
         }
     }
 
@@ -1795,6 +2042,13 @@ function Export-FioSqlBenchHtmlReport {
                                 [pscustomobject]@{ Key = 'IterationCount'; Label = 'iters'; Value = if ($null -ne $run.IterationCount) { [string]$run.IterationCount } else { $null } }
                                 [pscustomobject]@{ Key = 'FioVersion'; Label = 'fio'; Value = $run.FioVersion }
                                 [pscustomobject]@{ Key = 'TargetType'; Label = 'type'; Value = $run.TargetType }
+                            [pscustomobject]@{ Key = 'SmbServerName'; Label = 'server'; Value = if ($run.SmbMetadata) { $run.SmbMetadata.ServerName } else { $null } }
+                            [pscustomobject]@{ Key = 'SmbShareName'; Label = 'share'; Value = if ($run.SmbMetadata) { $run.SmbMetadata.ShareName } else { $null } }
+                            [pscustomobject]@{ Key = 'SmbDialect'; Label = 'dialect'; Value = if ($run.SmbMetadata) { $run.SmbMetadata.Dialect } else { $null } }
+                            [pscustomobject]@{ Key = 'SmbContinuouslyAvailable'; Label = 'ca'; Value = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.ContinuouslyAvailable) { [string]$run.SmbMetadata.ContinuouslyAvailable } else { $null } }
+                            [pscustomobject]@{ Key = 'SmbEncryptData'; Label = 'encrypt'; Value = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.EncryptData) { [string]$run.SmbMetadata.EncryptData } else { $null } }
+                            [pscustomobject]@{ Key = 'SmbMultichannelPathCount'; Label = 'channels'; Value = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.MultichannelPathCount) { [string]$run.SmbMetadata.MultichannelPathCount } else { $null } }
+                            [pscustomobject]@{ Key = 'SmbRdmaPathCount'; Label = 'rdma'; Value = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.RdmaPathCount) { [string]$run.SmbMetadata.RdmaPathCount } else { $null } }
                         )
 
                         $previousRunSettings = $null
@@ -1815,6 +2069,13 @@ function Export-FioSqlBenchHtmlReport {
                                         IterationCount = if ($null -ne $previous.IterationCount) { [string]$previous.IterationCount } else { $null }
                                         FioVersion = $previous.FioVersion
                                         TargetType = $previous.TargetType
+                                    SmbServerName = if ($previous.SmbMetadata) { $previous.SmbMetadata.ServerName } else { $null }
+                                    SmbShareName = if ($previous.SmbMetadata) { $previous.SmbMetadata.ShareName } else { $null }
+                                    SmbDialect = if ($previous.SmbMetadata) { $previous.SmbMetadata.Dialect } else { $null }
+                                    SmbContinuouslyAvailable = if ($previous.SmbMetadata -and $null -ne $previous.SmbMetadata.ContinuouslyAvailable) { [string]$previous.SmbMetadata.ContinuouslyAvailable } else { $null }
+                                    SmbEncryptData = if ($previous.SmbMetadata -and $null -ne $previous.SmbMetadata.EncryptData) { [string]$previous.SmbMetadata.EncryptData } else { $null }
+                                    SmbMultichannelPathCount = if ($previous.SmbMetadata -and $null -ne $previous.SmbMetadata.MultichannelPathCount) { [string]$previous.SmbMetadata.MultichannelPathCount } else { $null }
+                                    SmbRdmaPathCount = if ($previous.SmbMetadata -and $null -ne $previous.SmbMetadata.RdmaPathCount) { [string]$previous.SmbMetadata.RdmaPathCount } else { $null }
                                 }
                         }
 

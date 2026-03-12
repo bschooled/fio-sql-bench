@@ -18,7 +18,7 @@ Raw device benchmarking is intentionally blocked to reduce destructive risk.
 ## Prerequisites
 
 - PowerShell 7 or Windows PowerShell 5.1
-- `fio.exe` installed and available on `PATH`, or passed with `-FioPath` 
+- `fio.exe` installed and available on `PATH`, or passed with `-FioPath`
   - You can find *fio* from the releases page of [Fio](https://github.com/axboe/fio)
 - Permission to create a dedicated test directory on the target volume or SMB share
 
@@ -51,6 +51,7 @@ Default working set: `8 GB`.
 - `iodepth=1`
 - `numjobs=1`
 - `fsync=1`
+- direct I/O is enabled by default so client-side buffering is less likely to hide commit latency
 
 ### Tempdb
 
@@ -118,7 +119,15 @@ If `-TargetPath` does not exist yet, the script creates that directory before ge
 
 Target detection is automatic by default. UNC paths and mapped network drives such as `Z:` are treated as SMB targets, while ordinary drive-letter paths on local volumes are treated as local storage.
 
+Benchmark file preparation is now less expensive than the original implementation:
+
+- Prepared files are built once per run and then reused across all iterations in that run.
+- Pure write workloads such as the built-in `Log` profile skip the prep phase entirely because no pre-existing read surface is required.
+- If you are repeatedly testing the same target with the same settings, `-ReusePreparedFiles` keeps a validated prep cache under the target path and reuses it on later runs. This is especially helpful for slower SMB targets.
+
 The built-in `Data` and `Tempdb` profiles now default to larger working sets (`32 GB` and `16 GB`) so short benches are less likely to be dominated by RAM or filesystem cache effects.
+
+The harness now prints a cache-bypass assessment before execution. This is important because `direct=1` can bypass the Windows page cache for local `windowsaio` runs, and the built-in profiles now request direct I/O by default for SMB as well to reduce client-side cache effects. It still cannot generically bypass SSD controller DRAM, RAID cache, or SMB server-side cache. Very small working sets can still produce inflated numbers even when local page cache bypass is active.
 
 Run against an SMB share with explicit buffered I/O:
 
@@ -135,6 +144,15 @@ Run against a mapped SMB drive and let the script auto-detect it as SMB:
 .\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath 'Z:\SqlBench' `
   -Profile Data
+```
+
+Reuse previously prepared files for repeated runs against the same target and settings:
+
+```powershell
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath 'Z:\SqlBench' `
+  -Profile Data `
+  -ReusePreparedFiles
 ```
 
 Override defaults for a custom SQL-like test while still using a built-in profile baseline:
@@ -194,11 +212,16 @@ Each invocation writes results under `results\<timestamp>-<label>\`.
 
 For larger runs, the harness now performs an explicit file-preparation phase before the timed benchmark phase and verifies that each benchmark file reached the expected size before random reads begin.
 
+To reduce benchmark skew on storage that benefits from repeated or compressible payloads, generated fio jobs also enable `refill_buffers=1` so each submission refills the I/O buffer instead of reusing a more compression-friendly pattern.
+
 The console also renders a SQL-oriented summary table with color-coded latency interpretation:
 
 - `Excellent` and `Very good` indicate latency comfortably inside common SQL guidance.
 - `Watch` indicates tail latency or sustained latency that is approaching or exceeding Microsoft's `10-15 ms` investigation threshold.
 - `Poor` or worse indicates storage latency that should be treated as a SQL bottleneck candidate.
+- The console now includes `P99.9` latency in addition to mean, `P95`, and `P99`, because deep tail stalls are often what surface first in SQL workloads.
+- When multiple fio workers are active, the summary also tracks the worst worker `P99` so uneven latency across files or queues is easier to spot.
+- Bandwidth stability is surfaced as a coefficient of variation (`CV`) so bursty or throttled paths are easier to distinguish from stable baselines.
 - For multi-iteration runs, the console prints a `min / avg / max` rollup across iterations.
 - The console also prints profile-specific recommendations so the results read more like an operator report than a raw benchmark dump.
 
@@ -208,6 +231,7 @@ The script uses Microsoft guidance as its interpretation baseline:
 - Log-oriented writes: typically best in the `1-5 ms` range
 - Data/tempdb-oriented I/O: healthiest under `10 ms`, with `4-20 ms` as a common tuned range
 - SMB-backed targets are interpreted separately because network and file-server effects are part of the path. The script keeps the same `10-15 ms` SQL escalation rule, but it presents SMB guidance with slightly more forgiving healthy bands and adds SMB-specific recommendation text.
+- For SMB runs, the console also reports the resolved server/share, negotiated dialect, continuous-availability flag, encryption flag, visible multichannel path count, and RDMA-capable path count when Windows can resolve them.
 
 - `iter-01-fio.json`: raw `fio` JSON output
 - `iter-01-summary.json`: normalized summary for that iteration
@@ -221,6 +245,8 @@ The historical export script writes these additional artifacts under the chosen 
 - `historical-summary.json`: aggregated run-level data model across result folders
 - `historical-summary.csv`: flat run-level table for spreadsheets and diffing
 - `historical-report.html`: self-contained historical dashboard with rollup tables and inline charts
+
+The CSV exports now retain additional SQL-relevant tail and stability fields, including `P99.9`, worst-worker `P99`, and bandwidth variation, so external analysis can distinguish average health from deep-tail or burst-driven problems.
 
 The historical HTML report is intended to be comparative rather than just archival:
 
@@ -238,9 +264,12 @@ If a run fails, the target work folder is preserved automatically so the generat
 - Mapped network drives such as `Z:` are also classified as SMB automatically.
 - When a mapped drive is detected, the console output also shows the backing remote SMB path.
 - SMB tests measure storage, network, client cache, and protocol behavior together.
-- The script defaults to buffered I/O for SMB targets unless `-Direct On` is specified.
-- If `Get-SmbConnection` can resolve the share, the summary includes basic connection metadata.
+- The built-in profiles default to direct I/O for SMB targets as well as local targets. Use `-Direct Off` if you intentionally want a buffered run.
+- If `Get-SmbConnection` can resolve the share, the summary includes connection metadata such as dialect, open handles, encryption, and continuous availability.
+- If `Get-SmbMultichannelConnection` can resolve the server, the summary also includes visible channel and RDMA-capable path counts.
 - SMB console recommendations call out Microsoft guidance for SQL over SMB: ensure enough network bandwidth, prefer SMB Multichannel, and use SMB Direct/RDMA where available.
+- Historical and console interpretation for SMB should be read with the network path in mind. Microsoft’s SQL-over-SMB guidance assumes enough bandwidth for the workload and recommends SMB 3 features such as Multichannel, SMB Direct/RDMA, and continuous availability where applicable.
+- A direct-I/O setting on SMB reduces client-side caching risk only if the SMB path honors it. It does not guarantee bypass of server-side or storage-device cache.
 
 ## Safety Notes
 
