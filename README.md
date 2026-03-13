@@ -90,7 +90,7 @@ Default working set: `32 GB`.
 Show built-in help:
 
 ```powershell
-./scripts/Invoke-FioSqlBench.ps1 -Help
+.\scripts\Invoke-FioSqlBench.ps1 -Help
 ```
 
 If you want the script to emit the structured PowerShell result object in addition to the friendly console output, add `-PassThru`.
