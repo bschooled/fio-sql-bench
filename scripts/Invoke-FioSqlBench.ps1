@@ -583,7 +583,7 @@ function Get-FioOperationRenderModel {
     }
 }
 
-function Write-FioPerformanceTable {
+function Get-FioRenderableOperationRows {
     param(
         [string]$Profile,
         [string]$TargetType,
@@ -594,6 +594,30 @@ function Write-FioPerformanceTable {
         Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Read' -Stats $Summary.Read -Direct $Summary.Direct
         Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Write' -Stats $Summary.Write -Direct $Summary.Direct
     )
+
+    $activeRows = @(
+        $rows | Where-Object {
+            ($null -ne $_.TotalIos -and $_.TotalIos -gt 0) -or
+            ($null -ne $_.Iops -and $_.Iops -gt 0) -or
+            ($null -ne $_.BandwidthMBps -and $_.BandwidthMBps -gt 0)
+        }
+    )
+
+    if ($activeRows.Count -gt 0) {
+        return $activeRows
+    }
+
+    return $rows
+}
+
+function Write-FioPerformanceTable {
+    param(
+        [string]$Profile,
+        [string]$TargetType,
+        [pscustomobject]$Summary
+    )
+
+    $rows = @(Get-FioRenderableOperationRows -Profile $Profile -TargetType $TargetType -Summary $Summary)
 
     Write-Host ''
     Write-Host 'SQL-oriented performance summary' -ForegroundColor Cyan
@@ -614,10 +638,7 @@ function Write-FioSqlInterpretation {
         [pscustomobject]$Summary
     )
 
-    $rows = @(
-        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Read' -Stats $Summary.Read -Direct $Summary.Direct
-        Get-FioOperationRenderModel -Profile $Profile -TargetType $TargetType -Operation 'Write' -Stats $Summary.Write -Direct $Summary.Direct
-    )
+    $rows = @(Get-FioRenderableOperationRows -Profile $Profile -TargetType $TargetType -Summary $Summary)
 
     Write-Host 'SQL latency interpretation' -ForegroundColor Cyan
     Write-FioProperty -Name 'Microsoft rule' -Value 'Sustained 10-15 ms usually warrants SQL I/O investigation.'

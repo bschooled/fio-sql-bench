@@ -122,6 +122,7 @@ Target detection is automatic by default. UNC paths and mapped network drives su
 Benchmark file preparation is now less expensive than the original implementation:
 
 - Prepared files are built once per run and then reused across all iterations in that run.
+- The prep phase now uses larger sequential writes than the measured workload so SMB and other remote targets do not spend excessive time creating files with 8K synchronous I/O.
 - Pure write workloads such as the built-in `Log` profile skip the prep phase entirely because no pre-existing read surface is required.
 - If you are repeatedly testing the same target with the same settings, `-ReusePreparedFiles` keeps a validated prep cache under the target path and reuses it on later runs. This is especially helpful for slower SMB targets.
 

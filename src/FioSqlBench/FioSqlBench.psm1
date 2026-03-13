@@ -446,6 +446,26 @@ function Get-FioAlignedByteCount {
     [int64]($ByteCount - $remainder)
 }
 
+function Get-FioPreparationBlockSizeBytes {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Settings
+    )
+
+    [int64][math]::Max([int64]1MB, [int64]$Settings.BlockSizeBytes)
+}
+
+function Get-FioPreparationQueueDepth {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Settings
+    )
+
+    [int][math]::Min([int][math]::Max($Settings.QueueDepth, 1), 8)
+}
+
 function New-FioSqlBenchRunContext {
     [CmdletBinding()]
     param(
@@ -493,13 +513,16 @@ function New-FioSqlBenchJobContent {
         [switch]$EnableLogs
     )
 
+    $prepBlockSizeBytes = Get-FioPreparationBlockSizeBytes -Settings $Settings
+    $prepQueueDepth = Get-FioPreparationQueueDepth -Settings $Settings
+
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('[global]')
     $lines.Add('ioengine=windowsaio')
     $lines.Add('thread=1')
     $lines.Add('group_reporting=1')
     $lines.Add("direct=$($Settings.Direct)")
-    $lines.Add("bs=$($Settings.BlockSize)")
+    $lines.Add(("bs={0}" -f $(if ($Phase -eq 'Prep') { $prepBlockSizeBytes } else { $Settings.BlockSize })))
     $lines.Add("filesize=$($Settings.FileSizePerJobBytes)")
     $lines.Add("size=$($Settings.FileSizePerJobBytes)")
     $lines.Add('norandommap=1')
@@ -531,8 +554,8 @@ function New-FioSqlBenchJobContent {
             $lines.Add('[prep-{0:D2}]' -f $jobIndex)
             $lines.Add("filename=$filePath")
             $lines.Add('rw=write')
-            $lines.Add("bs=$($Settings.BlockSize)")
-            $lines.Add('iodepth=1')
+            $lines.Add(("bs={0}" -f $prepBlockSizeBytes))
+            $lines.Add(("iodepth={0}" -f $prepQueueDepth))
             $lines.Add('time_based=0')
             $lines.Add('end_fsync=1')
         }
