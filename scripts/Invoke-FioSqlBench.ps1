@@ -74,7 +74,7 @@ Explicit path to `fio.exe`. If omitted, the script searches PATH, installed
 program entries, and common Program Files locations.
 
 .PARAMETER EnableLogs
-Adds fio bandwidth and latency log files to the result set.
+Adds fio bandwidth, IOPS, and latency log files to the result set so diagnostics can chart throughput stability and transient stalls.
 
 .PARAMETER KeepJobFile
 Preserves the generated `.fio` job file in the results directory.
@@ -1708,6 +1708,7 @@ $aggregate = [pscustomobject]@{
     TargetType = $resolvedTarget.Type
     ResultDirectory = $runContext.ResultDirectory
     DiagnosticsEnabled = [bool]$EnableLogs
+    CpuAffinity = Get-FioCpuAffinitySummary -Settings $effectiveSettings
     Iterations = $iterationSummaries
 }
 

@@ -2,6 +2,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:FioDiagnosticsWindowMs = 1000
+$script:FioDiagnosticsStabilityWindowSamples = 5
 
 function Remove-FioNullPadding {
     [CmdletBinding()]
@@ -440,7 +441,132 @@ function Merge-FioSqlBenchSettings {
 
     $settings.BlockSizeBytes = $blockSizeBytes
     $settings.FileSizePerJobBytes = Get-FioAlignedByteCount -ByteCount $perJobBytes -Alignment $blockSizeBytes
+    $settings.CpuAffinity = Get-FioCpuAffinityPlan -Settings ([pscustomobject]$settings)
     [pscustomobject]$settings
+}
+
+function Get-FioCpuTopology {
+    [CmdletBinding()]
+    param()
+
+    $logicalCpuCount = [int][Environment]::ProcessorCount
+    $coreCount = $logicalCpuCount
+    $socketCount = 1
+
+    try {
+        $processors = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)
+        if ($processors.Count -gt 0) {
+            $socketCount = $processors.Count
+
+            $coreMeasure = ($processors | Measure-Object -Property NumberOfCores -Sum).Sum
+            if ($null -ne $coreMeasure -and [int]$coreMeasure -gt 0) {
+                $coreCount = [int]$coreMeasure
+            }
+
+            $logicalMeasure = ($processors | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+            if ($null -ne $logicalMeasure -and [int]$logicalMeasure -gt 0) {
+                $logicalCpuCount = [int]$logicalMeasure
+            }
+        }
+    }
+    catch {
+    }
+
+    [pscustomobject]@{
+        LogicalCpuCount = [int][math]::Max($logicalCpuCount, 1)
+        CoreCount = [int][math]::Max($coreCount, 1)
+        SocketCount = [int][math]::Max($socketCount, 1)
+    }
+}
+
+function Get-FioCpuAffinityPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Settings
+    )
+
+    $topology = Get-FioCpuTopology
+    $profileName = [string]$Settings.ProfileName
+    $supportsSplitAffinity = @('Data', 'Tempdb', 'MaxThroughput', 'MaxIOPs') -contains $profileName
+
+    if ($Settings.NumJobs -lt 2) {
+        return [pscustomobject]@{
+            Enabled = $false
+            Policy = $null
+            CpuIds = @()
+            CpuList = $null
+            Description = 'CPU affinity was skipped because the profile runs a single fio worker.'
+            Topology = $topology
+        }
+    }
+
+    if (-not $supportsSplitAffinity) {
+        return [pscustomobject]@{
+            Enabled = $false
+            Policy = $null
+            CpuIds = @()
+            CpuList = $null
+            Description = 'CPU affinity was skipped because this profile is latency-focused or stream-focused rather than worker-scaling focused.'
+            Topology = $topology
+        }
+    }
+
+    if ($topology.LogicalCpuCount -lt 4) {
+        return [pscustomobject]@{
+            Enabled = $false
+            Policy = $null
+            CpuIds = @()
+            CpuList = $null
+            Description = 'CPU affinity was skipped because the machine exposes fewer than four logical CPUs.'
+            Topology = $topology
+        }
+    }
+
+    $affinitizedCpuCount = [int][math]::Min($topology.LogicalCpuCount, [int]$Settings.NumJobs)
+    if ($affinitizedCpuCount -lt 2) {
+        return [pscustomobject]@{
+            Enabled = $false
+            Policy = $null
+            CpuIds = @()
+            CpuList = $null
+            Description = 'CPU affinity was skipped because fewer than two logical CPUs would be assigned.'
+            Topology = $topology
+        }
+    }
+
+    $cpuIds = @(0..($affinitizedCpuCount - 1))
+
+    return [pscustomobject]@{
+        Enabled = $true
+        Policy = 'split'
+        CpuIds = $cpuIds
+        CpuList = ($cpuIds -join ',')
+        Description = 'Split affinity pins multi-job fio workers across the first {0} logical CPUs ({1} logical / {2} cores / {3} sockets detected).' -f $affinitizedCpuCount, $topology.LogicalCpuCount, $topology.CoreCount, $topology.SocketCount
+        Topology = $topology
+    }
+}
+
+function Get-FioCpuAffinitySummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Settings
+    )
+
+    if (-not $Settings.PSObject.Properties['CpuAffinity'] -or $null -eq $Settings.CpuAffinity) {
+        return $null
+    }
+
+    [pscustomobject]@{
+        Enabled = [bool]$Settings.CpuAffinity.Enabled
+        Policy = if ($Settings.CpuAffinity.Policy) { [string]$Settings.CpuAffinity.Policy } else { $null }
+        CpuList = if ($Settings.CpuAffinity.CpuList) { [string]$Settings.CpuAffinity.CpuList } else { $null }
+        Description = [string]$Settings.CpuAffinity.Description
+        LogicalCpuCount = [int]$Settings.CpuAffinity.Topology.LogicalCpuCount
+        CoreCount = [int]$Settings.CpuAffinity.Topology.CoreCount
+        SocketCount = [int]$Settings.CpuAffinity.Topology.SocketCount
+    }
 }
 
 function ConvertFrom-FioSizeStringToBytes {
@@ -581,6 +707,11 @@ function New-FioSqlBenchJobContent {
         $lines.Add("runtime=$($Settings.RuntimeSec)")
         $lines.Add("ramp_time=$($Settings.RampSec)")
         $lines.Add("iodepth=$($Settings.QueueDepth)")
+
+        if ($Settings.PSObject.Properties['CpuAffinity'] -and $Settings.CpuAffinity -and $Settings.CpuAffinity.Enabled -and -not [string]::IsNullOrWhiteSpace([string]$Settings.CpuAffinity.CpuList)) {
+            $lines.Add("cpus_allowed=$($Settings.CpuAffinity.CpuList)")
+            $lines.Add("cpus_allowed_policy=$($Settings.CpuAffinity.Policy)")
+        }
     }
 
     if ($EnableLogs -and $Phase -ne 'Prep') {
@@ -956,10 +1087,180 @@ function ConvertFrom-FioJsonToSummary {
         ReadWrite = $Settings.ReadWrite
         ReadMix = $Settings.ReadMix
         Fsync = $Settings.Fsync
+        CpuAffinity = Get-FioCpuAffinitySummary -Settings $Settings
         Read = $read
         Write = $write
         Diagnostics = $diagnostics
     }
+}
+
+function Get-FioStandardDeviation {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [double[]]$Values
+    )
+
+    if ($null -eq $Values -or $Values.Count -eq 0) {
+        return $null
+    }
+
+    $average = ($Values | Measure-Object -Average).Average
+    if ($null -eq $average) {
+        return $null
+    }
+
+    if ($Values.Count -eq 1) {
+        return 0.0
+    }
+
+    $variance = (($Values | ForEach-Object { [math]::Pow(([double]$_ - [double]$average), 2) } | Measure-Object -Average).Average)
+    if ($null -eq $variance) {
+        return $null
+    }
+
+    return [math]::Sqrt([double]$variance)
+}
+
+function Get-FioCoefficientOfVariationFromValues {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [double[]]$Values
+    )
+
+    if ($null -eq $Values -or $Values.Count -eq 0) {
+        return $null
+    }
+
+    $mean = ($Values | Measure-Object -Average).Average
+    if ($null -eq $mean) {
+        return $null
+    }
+
+    if ([double]$mean -eq 0) {
+        $minValue = ($Values | Measure-Object -Minimum).Minimum
+        $maxValue = ($Values | Measure-Object -Maximum).Maximum
+        if ($minValue -eq 0 -and $maxValue -eq 0) {
+            return 0.0
+        }
+
+        return $null
+    }
+
+    return Get-FioCoefficientOfVariation -Mean ([double]$mean) -StdDev (Get-FioStandardDeviation -Values $Values)
+}
+
+function New-FioDiagnosticsBandwidthStabilitySeries {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Series,
+
+        [int]$WindowSize = $script:FioDiagnosticsStabilityWindowSamples
+    )
+
+    $orderedPoints = @($Series.Points | Sort-Object TimeMs)
+    if ($orderedPoints.Count -eq 0) {
+        return $null
+    }
+
+    $rollingPoints = New-Object System.Collections.Generic.List[object]
+    for ($index = 0; $index -lt $orderedPoints.Count; $index++) {
+        $startIndex = [math]::Max(0, ($index - $WindowSize + 1))
+        $windowValues = New-Object System.Collections.Generic.List[double]
+        for ($windowIndex = $startIndex; $windowIndex -le $index; $windowIndex++) {
+            $windowValues.Add([double]$orderedPoints[$windowIndex].Value)
+        }
+
+        $rollingCv = Get-FioCoefficientOfVariationFromValues -Values $windowValues.ToArray()
+        if ($null -eq $rollingCv) {
+            $rollingCv = 0.0
+        }
+
+        $rollingPoints.Add([pscustomobject]@{
+            TimeMs = [int]$orderedPoints[$index].TimeMs
+            Value = [double]$rollingCv
+        })
+    }
+
+    $rollingValues = @($rollingPoints | ForEach-Object { [double]$_.Value })
+    [pscustomobject]@{
+        Key = 'bandwidthstability-{0}' -f ([string]$Series.Direction).ToLowerInvariant()
+        Label = '{0} BW Stability' -f [string]$Series.Direction
+        Metric = 'bandwidthStability'
+        Direction = [string]$Series.Direction
+        Unit = 'CV %'
+        PreferredDecimals = 2
+        Points = $rollingPoints.ToArray()
+        Summary = [pscustomobject]@{
+            Min = if ($rollingValues.Count -gt 0) { ($rollingValues | Measure-Object -Minimum).Minimum } else { 0 }
+            Max = if ($rollingValues.Count -gt 0) { ($rollingValues | Measure-Object -Maximum).Maximum } else { 0 }
+            Avg = if ($rollingValues.Count -gt 0) { ($rollingValues | Measure-Object -Average).Average } else { 0 }
+            SampleCount = $rollingValues.Count
+            CvPercent = if ($Series.Summary -and $Series.Summary.PSObject.Properties['CvPercent']) { $Series.Summary.CvPercent } else { Get-FioCoefficientOfVariationFromValues -Values @($orderedPoints | ForEach-Object { [double]$_.Value }) }
+        }
+    }
+}
+
+function Get-FioBandwidthStabilityAssessment {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][double]$CvPercent
+    )
+
+    if ($null -eq $CvPercent) {
+        return [pscustomobject]@{
+            Label = 'No data'
+            Class = 'stability-neutral'
+        }
+    }
+
+    if ($CvPercent -le 5) {
+        return [pscustomobject]@{
+            Label = 'Stable'
+            Class = 'stability-good'
+        }
+    }
+
+    if ($CvPercent -le 10) {
+        return [pscustomobject]@{
+            Label = 'Moderate'
+            Class = 'stability-warn'
+        }
+    }
+
+    return [pscustomobject]@{
+        Label = 'Volatile'
+        Class = 'stability-bad'
+    }
+}
+
+function Get-FioDiagnosticsBandwidthStabilityModels {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Diagnostics
+    )
+
+    if ($null -eq $Diagnostics -or -not $Diagnostics.Available -or $null -eq $Diagnostics.Series) {
+        return @()
+    }
+
+    $bandwidthSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidth' } | Sort-Object Direction)
+    $models = foreach ($series in $bandwidthSeries) {
+        $cvPercent = if ($series.Summary -and $series.Summary.PSObject.Properties['CvPercent']) { $series.Summary.CvPercent } else { $null }
+        $assessment = Get-FioBandwidthStabilityAssessment -CvPercent $cvPercent
+        [pscustomobject]@{
+            Direction = [string]$series.Direction
+            DisplayLabel = '{0} BW' -f [string]$series.Direction
+            DisplayValue = if ($null -ne $cvPercent) { '{0:N2}% CV' -f [double]$cvPercent } else { 'n/a' }
+            AssessmentLabel = [string]$assessment.Label
+            Class = [string]$assessment.Class
+        }
+    }
+
+    @($models)
 }
 
 function Get-FioDiagnosticsSummary {
@@ -1007,6 +1308,7 @@ function Get-FioDiagnosticsSummary {
                     Max = [math]::Round([double]$item.Summary.Max, 4)
                     Avg = [math]::Round([double]$item.Summary.Avg, 4)
                     SampleCount = [int]$item.Summary.SampleCount
+                    CvPercent = if ($item.Summary.PSObject.Properties['CvPercent'] -and $null -ne $item.Summary.CvPercent) { [math]::Round([double]$item.Summary.CvPercent, 4) } else { $null }
                 }
             }
         }
@@ -1032,6 +1334,7 @@ function Get-FioDiagnosticsExpectations {
 
     return @(
         [pscustomobject]@{ Key = 'bandwidth'; Label = 'Throughput' }
+        [pscustomobject]@{ Key = 'bandwidthStability'; Label = 'BW Stability' }
         [pscustomobject]@{ Key = 'iops'; Label = 'IOPS' }
         [pscustomobject]@{ Key = 'latencyAvg'; Label = 'Avg Latency' }
         [pscustomobject]@{ Key = 'latencyMax'; Label = 'Max Latency' }
@@ -1166,8 +1469,16 @@ function Get-FioDiagnosticsData {
                 Max = if ($values.Count -gt 0) { ($values | Measure-Object -Maximum).Maximum } else { 0 }
                 Avg = if ($values.Count -gt 0) { ($values | Measure-Object -Average).Average } else { 0 }
                 SampleCount = $values.Count
+                CvPercent = Get-FioCoefficientOfVariationFromValues -Values @($values | ForEach-Object { [double]$_ })
             }
         })
+    }
+
+    foreach ($bandwidthSeries in @($series | Where-Object { $_.Metric -eq 'bandwidth' })) {
+        $stabilitySeries = New-FioDiagnosticsBandwidthStabilitySeries -Series $bandwidthSeries
+        if ($null -ne $stabilitySeries) {
+            $series.Add($stabilitySeries)
+        }
     }
 
     $orderedSeries = @($series | Sort-Object Metric, Direction)
@@ -1192,7 +1503,7 @@ function Get-FioDiagnosticsData {
         'Some diagnostics were captured, but not every telemetry stream was available.'
     }
     else {
-        'Windowed throughput, IOPS, and latency diagnostics were captured successfully.'
+        'Windowed throughput, BW stability, IOPS, and latency diagnostics were captured successfully.'
     }
 
     [pscustomobject]@{
@@ -1878,6 +2189,7 @@ function Get-FioHistoryRunAggregate {
         ReadWrite = if ($first.PSObject.Properties['ReadWrite']) { [string]$first.ReadWrite } else { $null }
         ReadMix = if ($first.PSObject.Properties['ReadMix']) { $first.ReadMix } else { $null }
         Fsync = if ($first.PSObject.Properties['Fsync']) { [int]$first.Fsync } else { $null }
+        CpuAffinity = if ($RootSummary.PSObject.Properties['CpuAffinity']) { $RootSummary.CpuAffinity } elseif ($first.PSObject.Properties['CpuAffinity']) { $first.CpuAffinity } else { $null }
         Read = $read
         Write = $write
         Diagnostics = $normalizedDiagnostics
@@ -2962,7 +3274,7 @@ function New-FioHtmlDiagnosticsSection {
             'Diagnostics were requested, but no chartable fio telemetry was captured. Check the iteration console log for fio log creation errors.'
         }
         else {
-            'Windowed fio telemetry aggregated across per-job logs so throttling, cache warm-up, and transient latency spikes are visible in the report.'
+            'Windowed fio telemetry aggregated across per-job logs so throughput stability, throttling, cache warm-up, and transient latency spikes are visible in the report.'
         }
 
         $summaryItems = @(
@@ -3003,10 +3315,12 @@ function New-FioHtmlDiagnosticsSection {
         }
 
         $throughputSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidth' })
+        $stabilitySeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidthStability' })
         $iopsSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'iops' })
         $latencySeries = @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' })
         $cards = New-Object System.Collections.Generic.List[string]
         $cards.Add((New-FioHtmlLineChartSection -Title 'Throughput Over Time' -Series $throughputSeries -Subtitle ('Windowed fio bandwidth logs sampled every {0} ms.' -f $Diagnostics.LogWindowMs)))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'BW Stability Over Time' -Series $stabilitySeries -Subtitle ('Rolling {0}-sample coefficient of variation from fio bandwidth logs. Lower is steadier.' -f $script:FioDiagnosticsStabilityWindowSamples)))
         $cards.Add((New-FioHtmlLineChartSection -Title 'IOPS Over Time' -Series $iopsSeries -Subtitle ('Windowed fio IOPS logs sampled every {0} ms.' -f $Diagnostics.LogWindowMs)))
         $cards.Add((New-FioHtmlLineChartSection -Title 'Completion Latency Over Time' -Series $latencySeries -Subtitle ('Average and max completion latency from fio clat logs, useful for spotting stalls and throttling.' -f $Diagnostics.LogWindowMs)))
 
@@ -3039,6 +3353,8 @@ function Get-FioDiagnosticsSeriesColor {
     switch ('{0}-{1}' -f $Metric.ToLowerInvariant(), $Direction.ToLowerInvariant()) {
         'bandwidth-read' { return '#0f766e' }
         'bandwidth-write' { return '#b45309' }
+        'bandwidthstability-read' { return '#0891b2' }
+        'bandwidthstability-write' { return '#dc2626' }
         'iops-read' { return '#0f766e' }
         'iops-write' { return '#b45309' }
         'latencyavg-read' { return '#2563eb' }
@@ -3091,20 +3407,23 @@ function Get-FioDiagnosticsChartModels {
 
     $definitions = @(
         [pscustomobject]@{ Key = 'bandwidth'; Title = 'Throughput Over Time'; Subtitle = 'Windowed fio bandwidth samples across the selected run.'; YAxisTitle = 'MB/s' }
+        [pscustomobject]@{ Key = 'bandwidthStability'; Title = 'BW Stability Over Time'; Subtitle = 'Rolling bandwidth coefficient of variation. Lower percentages indicate steadier delivery.'; YAxisTitle = 'CV %' }
         [pscustomobject]@{ Key = 'iops'; Title = 'IOPS Over Time'; Subtitle = 'Windowed fio IOPS samples across the selected run.'; YAxisTitle = 'IOPS' }
         [pscustomobject]@{ Key = 'latency'; Title = 'Completion Latency Over Time'; Subtitle = 'Average and max completion latency, useful for spotting stalls and throttling.'; YAxisTitle = 'Milliseconds' }
     )
 
     $models = New-Object System.Collections.Generic.List[object]
     foreach ($definition in $definitions) {
-        $metricSeries = if ($definition.Key -eq 'latency') {
-            @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' })
-        }
-        else {
-            @($Diagnostics.Series | Where-Object { $_.Metric -eq $definition.Key })
-        }
+        $metricSeries = @(
+            if ($definition.Key -eq 'latency') {
+                @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' })
+            }
+            else {
+                @($Diagnostics.Series | Where-Object { $_.Metric -eq $definition.Key })
+            }
+        )
 
-        if ($metricSeries.Count -eq 0) {
+        if (@($metricSeries).Count -eq 0) {
             continue
         }
 
@@ -3301,6 +3620,7 @@ function Export-FioSqlBenchHtmlReportStatic {
 
                 switch ($Key) {
                         'bandwidth' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidth' }) }
+                    'bandwidthStability' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidthStability' }) }
                         'iops' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'iops' }) }
                         'latency' { return @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' }) }
                         default { return @() }
@@ -3466,7 +3786,8 @@ function Export-FioSqlBenchHtmlReportStatic {
                 }
             }
         )
-        $lowestMeanLatencyResult = @($lowestMeanLatencyResult | Sort-Object MeanMs, Profile | Select-Object -First 1)[0]
+        $lowestReadLatencyResult = $lowestMeanLatencyResult | Where-Object { $_.Operation -eq 'Read' } | Sort-Object MeanMs, Profile | Select-Object -First 1
+        $lowestWriteLatencyResult = $lowestMeanLatencyResult | Where-Object { $_.Operation -eq 'Write' } | Sort-Object MeanMs, Profile | Select-Object -First 1
         $newestProfileSnapshot = @($profileLatestRuns | Sort-Object TimestampUtc -Descending | Select-Object -First 1)[0]
 
         $heroMetricCards = @(
@@ -3493,9 +3814,12 @@ function Export-FioSqlBenchHtmlReportStatic {
         $bestReadThroughputValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$bestReadThroughputProfileRun.Read.BandwidthMBps))
         $bestWriteThroughputProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestWriteThroughputProfileRun.Profile)
         $bestWriteThroughputValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$bestWriteThroughputProfileRun.Write.BandwidthMBps))
-        $lowestLatencyContextHtml = [System.Net.WebUtility]::HtmlEncode(('{0} - {1}' -f $lowestMeanLatencyResult.Profile, $lowestMeanLatencyResult.Operation))
-        $lowestLatencyValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$lowestMeanLatencyResult.MeanMs))
-        $lowestLatencyAssessmentHtml = [System.Net.WebUtility]::HtmlEncode([string]$lowestMeanLatencyResult.Assessment)
+        $lowestReadLatencyContextHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode([string]$lowestReadLatencyResult.Profile) } else { '-' }
+        $lowestReadLatencyValueHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$lowestReadLatencyResult.MeanMs)) } else { '-' }
+        $lowestReadLatencyAssessmentHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode([string]$lowestReadLatencyResult.Assessment) } else { '-' }
+        $lowestWriteLatencyContextHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode([string]$lowestWriteLatencyResult.Profile) } else { '-' }
+        $lowestWriteLatencyValueHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$lowestWriteLatencyResult.MeanMs)) } else { '-' }
+        $lowestWriteLatencyAssessmentHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode([string]$lowestWriteLatencyResult.Assessment) } else { '-' }
 
         $highlightHtml = @(
             @'
@@ -3534,15 +3858,23 @@ function Export-FioSqlBenchHtmlReportStatic {
 '@ -f $bestReadThroughputProfileHtml, $bestReadThroughputValueHtml, $bestWriteThroughputProfileHtml, $bestWriteThroughputValueHtml
             @'
     <article class="highlight-card">
-        <div class="metric-label">Latency Leader</div>
-        <div class="highlight-stat highlight-stat-single">
-            <div class="highlight-stat-label">Lowest Mean Latency</div>
-            <div class="highlight-stat-context">{0}</div>
-            <div class="highlight-metric">{1}</div>
-            <div class="highlight-secondary">{2} assessment on current mean latency</div>
+        <div class="metric-label">Latency Leaders</div>
+        <div class="highlight-stat-grid">
+            <div class="highlight-stat">
+                <div class="highlight-stat-label tone-read">Lowest Read Mean Latency</div>
+                <div class="highlight-stat-context">{0}</div>
+                <div class="highlight-metric tone-read">{1}</div>
+                <div class="highlight-secondary">{2} assessment on current mean latency</div>
+            </div>
+            <div class="highlight-stat">
+                <div class="highlight-stat-label tone-write">Lowest Write Mean Latency</div>
+                <div class="highlight-stat-context">{3}</div>
+                <div class="highlight-metric tone-write">{4}</div>
+                <div class="highlight-secondary">{5} assessment on current mean latency</div>
+            </div>
         </div>
     </article>
-'@ -f $lowestLatencyContextHtml, $lowestLatencyValueHtml, $lowestLatencyAssessmentHtml
+'@ -f $lowestReadLatencyContextHtml, $lowestReadLatencyValueHtml, $lowestReadLatencyAssessmentHtml, $lowestWriteLatencyContextHtml, $lowestWriteLatencyValueHtml, $lowestWriteLatencyAssessmentHtml
         )
 
         $latestByProfileHtml = foreach ($run in @($profileLatestRuns | Sort-Object Profile)) {
@@ -3554,6 +3886,7 @@ function Export-FioSqlBenchHtmlReportStatic {
                 $writeMetricModel = GetOperationFocusMetricModel -Run $run -Operation 'Write' -Focus $focus
             $channelCount = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.MultichannelPathCount) { [int]$run.SmbMetadata.MultichannelPathCount } else { $null }
             $rdmaCount = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.RdmaPathCount) { [int]$run.SmbMetadata.RdmaPathCount } else { $null }
+            $stabilityBadgeModels = @(Get-FioDiagnosticsBandwidthStabilityModels -Diagnostics $run.Diagnostics)
             $profileDetailSettings = @(
                 [pscustomobject]@{ Key = 'BlockSize'; Label = 'bs'; Value = [string]$run.BlockSize }
                 [pscustomobject]@{ Key = 'QueueDepth'; Label = 'qd'; Value = if ($null -ne $run.QueueDepth) { [string]$run.QueueDepth } else { $null } }
@@ -3568,6 +3901,11 @@ function Export-FioSqlBenchHtmlReportStatic {
                 [pscustomobject]@{ Key = 'TargetType'; Label = 'type'; Value = if (-not $run.SmbMetadata) { [string]$run.TargetType } else { $null } }
             )
             $profileDetailBadges = ConvertTo-FioHtmlSettingBadges -Settings $profileDetailSettings
+            $stabilityBadgeHtml = @(
+                foreach ($stabilityBadge in $stabilityBadgeModels) {
+                    "<span class='stability-pill {0}'>{1} {2}</span>" -f $stabilityBadge.Class, [System.Net.WebUtility]::HtmlEncode([string]$stabilityBadge.DisplayLabel), [System.Net.WebUtility]::HtmlEncode([string]$stabilityBadge.DisplayValue)
+                }
+            )
                 $statusClass = switch ($diagState.Status) {
                         'Available' { 'diag-good' }
                         'Partial' { 'diag-warn' }
@@ -3613,6 +3951,7 @@ function Export-FioSqlBenchHtmlReportStatic {
         <div class="profile-card-badges">
             <span class="focus-pill">{3}</span>
             <span class="assessment-pill {4}">{5}</span>
+            {22}
         </div>
         </div>
         <div class="profile-target">{6}</div>
@@ -3649,7 +3988,7 @@ function Export-FioSqlBenchHtmlReportStatic {
         </div>
         <p class="profile-analysis">{21}</p>
 </article>
-'@ -f $profileNameHtml, $profileStampHtml, $diagnosticAnchorHtml, $focusLabelHtml, $assessmentClass, $assessmentLabelHtml, $targetTextHtml, $profileDetailBadges, $readLabelHtml, $readPrimaryHtml, $readSecondaryHtml, $writeLabelHtml, $writePrimaryHtml, $writeSecondaryHtml, $readLatencyClassSuffix, $readP99NumberHtml, $readP99UnitHtml, $writeLatencyClassSuffix, $writeP99NumberHtml, $writeP99UnitHtml, $diagnosticsDetailHtml, $sqlFitBlurbHtml
+'@ -f $profileNameHtml, $profileStampHtml, $diagnosticAnchorHtml, $focusLabelHtml, $assessmentClass, $assessmentLabelHtml, $targetTextHtml, $profileDetailBadges, $readLabelHtml, $readPrimaryHtml, $readSecondaryHtml, $writeLabelHtml, $writePrimaryHtml, $writeSecondaryHtml, $readLatencyClassSuffix, $readP99NumberHtml, $readP99UnitHtml, $writeLatencyClassSuffix, $writeP99NumberHtml, $writeP99UnitHtml, $diagnosticsDetailHtml, $sqlFitBlurbHtml, ($stabilityBadgeHtml -join '')
         }
 
         $coverageRows = @(
@@ -4255,6 +4594,20 @@ function Export-FioSqlBenchHtmlReportStatic {
         .assessment-good { background: rgba(59,130,246,0.14); color: #1d4ed8; }
         .assessment-poor { background: rgba(239,68,68,0.14); color: #b91c1c; }
         .assessment-neutral { background: rgba(148,163,184,0.18); color: #475569; }
+        .stability-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 0.72rem;
+            font-weight: 800;
+            letter-spacing: 0.04em;
+            white-space: nowrap;
+        }
+        .stability-good { background: rgba(16,185,129,0.16); color: #047857; }
+        .stability-warn { background: rgba(245,158,11,0.18); color: #b45309; }
+        .stability-bad { background: rgba(239,68,68,0.14); color: #b91c1c; }
+        .stability-neutral { background: rgba(148,163,184,0.18); color: #475569; }
         .diag-pill {
             display: inline-flex;
             align-items: center;
@@ -4606,7 +4959,7 @@ function Export-FioSqlBenchHtmlReportStatic {
     <main>
         <section class='hero'>
             <h1 class='hero-title'>$([System.Net.WebUtility]::HtmlEncode($Title))</h1>
-            <p class='hero-subtitle'>Cross-profile benchmark scan built from the freshest run in each profile, with throughput, IOPS, latency, and diagnostics coverage prioritized for quick comparison.</p>
+            <p class='hero-subtitle'>Cross-profile benchmark scan built from the freshest run in each profile, with throughput, BW stability, IOPS, latency, and diagnostics coverage prioritized for quick comparison.</p>
             <div class='hero-meta'>
                 <span>Generated $([System.Net.WebUtility]::HtmlEncode((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))</span>
                 <span>Results root: $([System.Net.WebUtility]::HtmlEncode($resultsRootText))</span>
@@ -4690,4 +5043,4 @@ function Export-FioSqlBenchHtmlReport {
     return
 }
 
-Export-ModuleMember -Function Resolve-FioSqlBenchTarget, Get-FioSqlBenchProfileDefaults, Merge-FioSqlBenchSettings, New-FioSqlBenchRunContext, New-FioSqlBenchJobContent, Get-FioBenchFilePaths, Test-FioPreparedFiles, Resolve-FioBinary, Invoke-FioSqlBenchRun, ConvertFrom-FioJsonToSummary, Export-FioSqlBenchCsv, Export-FioSqlBenchDiagnosticsCsv, Import-FioSqlBenchHistory, Get-FioHistoricalRollup, Export-FioSqlBenchHistoricalCsv, Export-FioSqlBenchHtmlReport, New-FioHtmlProfileComparisonSection, ConvertTo-FioHtmlSettingBadges
+Export-ModuleMember -Function Resolve-FioSqlBenchTarget, Get-FioSqlBenchProfileDefaults, Merge-FioSqlBenchSettings, New-FioSqlBenchRunContext, New-FioSqlBenchJobContent, Get-FioBenchFilePaths, Test-FioPreparedFiles, Resolve-FioBinary, Invoke-FioSqlBenchRun, ConvertFrom-FioJsonToSummary, Export-FioSqlBenchCsv, Export-FioSqlBenchDiagnosticsCsv, Import-FioSqlBenchHistory, Get-FioHistoricalRollup, Export-FioSqlBenchHistoricalCsv, Export-FioSqlBenchHtmlReport, New-FioHtmlProfileComparisonSection, ConvertTo-FioHtmlSettingBadges, Get-FioCpuAffinitySummary
