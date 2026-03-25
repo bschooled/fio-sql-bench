@@ -42,6 +42,7 @@ Emits the aggregated historical object for automation.
 .EXAMPLE
 ./scripts/Export-FioSqlBenchReport.ps1 -Profile Data -TargetType Smb -Newest 10
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidAssignmentToAutomaticVariable', 'Profile', Justification = 'The public CLI intentionally uses -Profile for backward compatibility.')]
 [CmdletBinding()]
 param(
     [string]$ResultsRoot = (Join-Path -Path (Get-Location) -ChildPath 'results'),
@@ -52,7 +53,7 @@ param(
 
     [string]$CsvPath,
 
-    [ValidateSet('Any', 'Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan')]
+    [ValidateSet('Any', 'Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan', 'MaxThroughput', 'MaxIOPs')]
     [string]$Profile = 'Any',
 
     [ValidateSet('Any', 'Local', 'Smb')]

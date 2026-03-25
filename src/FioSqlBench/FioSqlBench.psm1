@@ -1,6 +1,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$script:FioDiagnosticsWindowMs = 1000
+
 function Remove-FioNullPadding {
     [CmdletBinding()]
     param(
@@ -222,10 +224,11 @@ function Get-SmbTargetMetadata {
 }
 
 function Get-FioSqlBenchProfileDefaults {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidAssignmentToAutomaticVariable', 'Profile', Justification = 'The public function intentionally exposes -Profile.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan')]
+        [ValidateSet('Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan', 'MaxThroughput', 'MaxIOPs', 'All')]
         [string]$Profile
     )
 
@@ -315,6 +318,46 @@ function Get-FioSqlBenchProfileDefaults {
                 ReadWrite = 'read'
             }
         }
+        'MaxThroughput' {
+            return [ordered]@{
+                ProfileName = 'MaxThroughput'
+                FileSizeGB = 64
+                RuntimeSec = 120
+                RampSec = 10
+                Iterations = 1
+                QueueDepth = 32
+                NumJobs = 4
+                BlockSize = '1m'
+                ReadMix = 50
+                Fsync = 0
+                DirectLocal = 1
+                DirectSmb = 1
+                ReadWrite = 'rw'
+            }
+        }
+        'MaxIOPs' {
+            return [ordered]@{
+                ProfileName = 'MaxIOPs'
+                FileSizeGB = 32
+                RuntimeSec = 120
+                RampSec = 10
+                Iterations = 1
+                QueueDepth = 64
+                NumJobs = 8
+                BlockSize = '4k'
+                ReadMix = $null
+                Fsync = 0
+                DirectLocal = 1
+                DirectSmb = 1
+                ReadWrite = 'randread+randwrite'
+            }
+        }
+        'All' {
+            return [ordered]@{
+                ProfileName = 'All'
+                ChildProfiles = @('MaxThroughput', 'Data', 'DbccScan', 'BackupRestore', 'MaxIOPs', 'Tempdb', 'Log')
+            }
+        }
     }
 }
 
@@ -342,6 +385,7 @@ function Merge-FioSqlBenchSettings {
     )
 
     $settings = [ordered]@{
+        ProfileName = [string]$ProfileDefaults.ProfileName
         FileSizeGB = if ($null -ne $FileSizeGB) { [decimal]$FileSizeGB } else { [decimal]$ProfileDefaults.FileSizeGB }
         RuntimeSec = if ($null -ne $RuntimeSec) { [int]$RuntimeSec } else { [int]$ProfileDefaults.RuntimeSec }
         RampSec = if ($null -ne $RampSec) { [int]$RampSec } else { [int]$ProfileDefaults.RampSec }
@@ -478,14 +522,14 @@ function New-FioSqlBenchRunContext {
         [string]$RunLabel,
 
         [Parameter(Mandatory)]
-        [string]$Profile,
+        [string]$WorkloadProfile,
 
         [Parameter(Mandatory)]
         [pscustomobject]$Settings
     )
 
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $label = if ($RunLabel) { $RunLabel } else { $Profile.ToLowerInvariant() }
+    $label = if ($RunLabel) { $RunLabel } else { $WorkloadProfile.ToLowerInvariant() }
     $sanitizedLabel = ($label -replace '[^a-zA-Z0-9_-]', '-')
     $runId = "$timestamp-$sanitizedLabel"
 
@@ -540,9 +584,12 @@ function New-FioSqlBenchJobContent {
     }
 
     if ($EnableLogs -and $Phase -ne 'Prep') {
-        $logBase = ConvertTo-FioJobPath -Path (Join-Path -Path $RunContext.ResultDirectory -ChildPath 'fio')
+        $logBase = 'fio'
         $lines.Add("write_bw_log=$logBase")
+        $lines.Add("write_iops_log=$logBase")
         $lines.Add("write_lat_log=$logBase")
+        $lines.Add("log_avg_msec=$script:FioDiagnosticsWindowMs")
+        $lines.Add('log_window_value=both')
         $lines.Add('per_job_logs=1')
     }
 
@@ -562,21 +609,47 @@ function New-FioSqlBenchJobContent {
     }
 
     if ($Phase -in @('Bench', 'Combined')) {
-        for ($jobIndex = 1; $jobIndex -le $Settings.NumJobs; $jobIndex++) {
-            $filePath = ConvertTo-FioJobPath -Path (Join-Path -Path $RunContext.TargetRunDirectory -ChildPath ('testfile.{0:D2}.dat' -f $jobIndex))
+        if ($Settings.ProfileName -eq 'MaxIOPs') {
+            foreach ($operation in @(
+                @{ Label = 'read'; Rw = 'randread'; UseStonewall = $false },
+                @{ Label = 'write'; Rw = 'randwrite'; UseStonewall = $true }
+            )) {
+                for ($jobIndex = 1; $jobIndex -le $Settings.NumJobs; $jobIndex++) {
+                    $filePath = ConvertTo-FioJobPath -Path (Join-Path -Path $RunContext.TargetRunDirectory -ChildPath ('testfile.{0:D2}.dat' -f $jobIndex))
 
-            $lines.Add('')
-            $lines.Add('[bench-{0:D2}]' -f $jobIndex)
-            $lines.Add("filename=$filePath")
-            if ($Phase -eq 'Combined' -and $jobIndex -eq 1) {
-                $lines.Add('stonewall=1')
+                    $lines.Add('')
+                    $lines.Add(("[bench-{0}-{1}]" -f $operation.Label, ('{0:D2}' -f $jobIndex)))
+                    $lines.Add("filename=$filePath")
+                    if ($operation.UseStonewall -and $jobIndex -eq 1) {
+                        $lines.Add('stonewall=1')
+                    }
+                    elseif ($Phase -eq 'Combined' -and -not $operation.UseStonewall -and $jobIndex -eq 1) {
+                        $lines.Add('stonewall=1')
+                    }
+                    $lines.Add("rw=$($operation.Rw)")
+                    if ($Settings.Fsync -gt 0) {
+                        $lines.Add("fsync=$($Settings.Fsync)")
+                    }
+                }
             }
-            $lines.Add("rw=$($Settings.ReadWrite)")
-            if ($null -ne $Settings.ReadMix) {
-                $lines.Add("rwmixread=$($Settings.ReadMix)")
-            }
-            if ($Settings.Fsync -gt 0) {
-                $lines.Add("fsync=$($Settings.Fsync)")
+        }
+        else {
+            for ($jobIndex = 1; $jobIndex -le $Settings.NumJobs; $jobIndex++) {
+                $filePath = ConvertTo-FioJobPath -Path (Join-Path -Path $RunContext.TargetRunDirectory -ChildPath ('testfile.{0:D2}.dat' -f $jobIndex))
+
+                $lines.Add('')
+                $lines.Add('[bench-{0:D2}]' -f $jobIndex)
+                $lines.Add("filename=$filePath")
+                if ($Phase -eq 'Combined' -and $jobIndex -eq 1) {
+                    $lines.Add('stonewall=1')
+                }
+                $lines.Add("rw=$($Settings.ReadWrite)")
+                if ($null -ne $Settings.ReadMix) {
+                    $lines.Add("rwmixread=$($Settings.ReadMix)")
+                }
+                if ($Settings.Fsync -gt 0) {
+                    $lines.Add("fsync=$($Settings.Fsync)")
+                }
             }
         }
     }
@@ -806,8 +879,16 @@ function Invoke-FioSqlBenchRun {
         $JobFilePath
     )
 
-    $consoleOutput = & $FioPath @arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    $workingDirectory = Split-Path -Path $OutputJsonPath -Parent
+    Push-Location -LiteralPath $workingDirectory
+    try {
+        $consoleOutput = & $FioPath @arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+
     $consoleOutput | Set-Content -Path $ConsoleLogPath -Encoding utf8
 
     if ($exitCode -ne 0) {
@@ -855,6 +936,7 @@ function ConvertFrom-FioJsonToSummary {
 
     $read = Merge-FioOperationStats -Jobs $jobs -OperationName 'read'
     $write = Merge-FioOperationStats -Jobs $jobs -OperationName 'write'
+    $diagnostics = Get-FioDiagnosticsSummary -ResultDirectory $RunContext.ResultDirectory
 
     [pscustomobject]@{
         RunId = $RunContext.RunId
@@ -876,7 +958,344 @@ function ConvertFrom-FioJsonToSummary {
         Fsync = $Settings.Fsync
         Read = $read
         Write = $write
+        Diagnostics = $diagnostics
     }
+}
+
+function Get-FioDiagnosticsSummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ResultDirectory
+    )
+
+    $raw = Get-FioDiagnosticsData -ResultDirectory $ResultDirectory
+    if (-not $raw.Available) {
+        return [pscustomobject]@{
+            Requested = $false
+            Available = $false
+            Status = [string]$raw.Status
+            Message = [string]$raw.Message
+            LogWindowMs = $script:FioDiagnosticsWindowMs
+            TimeRangeMs = $null
+            MissingMetrics = @($raw.MissingMetrics)
+            PresentMetrics = @($raw.PresentMetrics)
+            Series = @()
+            SourceFiles = @($raw.SourceFiles)
+        }
+    }
+
+    $series = @(
+        foreach ($item in $raw.Series) {
+            [pscustomobject]@{
+                Key = $item.Key
+                Label = $item.Label
+                Metric = $item.Metric
+                Direction = $item.Direction
+                Unit = $item.Unit
+                PreferredDecimals = $item.PreferredDecimals
+                Points = @(
+                    foreach ($point in $item.Points) {
+                        [pscustomobject]@{
+                            TimeMs = [int]$point.TimeMs
+                            Value = [math]::Round([double]$point.Value, 4)
+                        }
+                    }
+                )
+                Summary = [pscustomobject]@{
+                    Min = [math]::Round([double]$item.Summary.Min, 4)
+                    Max = [math]::Round([double]$item.Summary.Max, 4)
+                    Avg = [math]::Round([double]$item.Summary.Avg, 4)
+                    SampleCount = [int]$item.Summary.SampleCount
+                }
+            }
+        }
+    )
+
+    [pscustomobject]@{
+        Requested = $false
+        Available = $true
+        Status = [string]$raw.Status
+        Message = [string]$raw.Message
+        LogWindowMs = $raw.LogWindowMs
+        TimeRangeMs = $raw.TimeRangeMs
+        MissingMetrics = @($raw.MissingMetrics)
+        PresentMetrics = @($raw.PresentMetrics)
+        Series = $series
+        SourceFiles = @($raw.SourceFiles)
+    }
+}
+
+function Get-FioDiagnosticsExpectations {
+    [CmdletBinding()]
+    param()
+
+    return @(
+        [pscustomobject]@{ Key = 'bandwidth'; Label = 'Throughput' }
+        [pscustomobject]@{ Key = 'iops'; Label = 'IOPS' }
+        [pscustomobject]@{ Key = 'latencyAvg'; Label = 'Avg Latency' }
+        [pscustomobject]@{ Key = 'latencyMax'; Label = 'Max Latency' }
+    )
+}
+
+function Get-FioDiagnosticsData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ResultDirectory
+    )
+
+    $expectedMetrics = @(Get-FioDiagnosticsExpectations)
+
+    if (-not (Test-Path -LiteralPath $ResultDirectory)) {
+        return [pscustomobject]@{
+            Available = $false
+            Status = 'Unavailable'
+            Message = 'The result directory was not found, so diagnostics could not be evaluated.'
+            LogWindowMs = $script:FioDiagnosticsWindowMs
+            TimeRangeMs = $null
+            MissingMetrics = @($expectedMetrics.Label)
+            PresentMetrics = @()
+            Series = @()
+            SourceFiles = @()
+        }
+    }
+
+    $seriesMap = [ordered]@{}
+    $sourceFiles = New-Object System.Collections.Generic.List[string]
+    $patternMap = @(
+        @{ Pattern = 'fio_bw*.log'; Metric = 'bandwidth'; Unit = 'MB/s'; Divisor = 1024.0; PreferredDecimals = 2; DirectionLabels = @{ '0' = 'Read'; '1' = 'Write'; '2' = 'Trim' } },
+        @{ Pattern = 'fio_iops*.log'; Metric = 'iops'; Unit = 'IOPS'; Divisor = 1.0; PreferredDecimals = 0; DirectionLabels = @{ '0' = 'Read'; '1' = 'Write'; '2' = 'Trim' } },
+        @{ Pattern = 'fio_clat*.log'; Metric = 'latencyAvg'; Unit = 'ms'; Divisor = 1000000.0; PreferredDecimals = 2; DirectionLabels = @{ '0' = 'Read'; '1' = 'Write'; '2' = 'Trim' }; ValueIndex = 1; LabelSuffix = 'Avg Latency' },
+        @{ Pattern = 'fio_clat*.log'; Metric = 'latencyMax'; Unit = 'ms'; Divisor = 1000000.0; PreferredDecimals = 2; DirectionLabels = @{ '0' = 'Read'; '1' = 'Write'; '2' = 'Trim' }; ValueIndex = 2; LabelSuffix = 'Max Latency' }
+    )
+
+    foreach ($pattern in $patternMap) {
+        $files = @(Get-ChildItem -LiteralPath $ResultDirectory -Filter $pattern.Pattern -File -ErrorAction SilentlyContinue)
+        foreach ($file in $files) {
+            $sourceFiles.Add($file.FullName)
+            $rows = Read-FioDiagnosticsLogFile -Path $file.FullName -ValueIndex $(if ($pattern.ContainsKey('ValueIndex')) { [int]$pattern.ValueIndex } else { 1 }) -Divisor $pattern.Divisor
+            foreach ($row in $rows) {
+                $directionLabel = if ($pattern.DirectionLabels.ContainsKey([string]$row.Direction)) { [string]$pattern.DirectionLabels[[string]$row.Direction] } else { ('Direction {0}' -f [string]$row.Direction) }
+                if ($directionLabel -eq 'Trim') {
+                    continue
+                }
+
+                $seriesKey = '{0}-{1}' -f $pattern.Metric, $directionLabel.ToLowerInvariant()
+                if (-not $seriesMap.Contains($seriesKey)) {
+                    $label = if ($pattern.ContainsKey('LabelSuffix')) {
+                        '{0} {1}' -f $directionLabel, $pattern.LabelSuffix
+                    }
+                    elseif ($pattern.Metric -eq 'bandwidth') {
+                        '{0} Throughput' -f $directionLabel
+                    }
+                    elseif ($pattern.Metric -eq 'iops') {
+                        '{0} IOPS' -f $directionLabel
+                    }
+                    else {
+                        '{0} {1}' -f $directionLabel, $pattern.Metric
+                    }
+
+                    $seriesMap[$seriesKey] = [ordered]@{
+                        Key = $seriesKey
+                        Label = $label
+                        Metric = $pattern.Metric
+                        Direction = $directionLabel
+                        Unit = $pattern.Unit
+                        PreferredDecimals = $pattern.PreferredDecimals
+                        PointsByTime = @{}
+                    }
+                }
+
+                $pointBucket = $seriesMap[$seriesKey].PointsByTime
+                $bucketKey = [string]$row.TimeMs
+                if (-not $pointBucket.ContainsKey($bucketKey)) {
+                    $pointBucket[$bucketKey] = 0.0
+                }
+                $pointBucket[$bucketKey] = [double]$pointBucket[$bucketKey] + [double]$row.Value
+            }
+        }
+    }
+
+    if ($seriesMap.Count -eq 0) {
+        $status = if ($sourceFiles.Count -gt 0) { 'Unreadable' } else { 'MissingLogs' }
+        $message = if ($sourceFiles.Count -gt 0) {
+            'fio diagnostic log files were found, but no chartable samples could be parsed from them.'
+        }
+        else {
+            'No fio diagnostic log files were found in the result directory.'
+        }
+
+        return [pscustomobject]@{
+            Available = $false
+            Status = $status
+            Message = $message
+            LogWindowMs = $script:FioDiagnosticsWindowMs
+            TimeRangeMs = $null
+            MissingMetrics = @($expectedMetrics.Label)
+            PresentMetrics = @()
+            Series = @()
+            SourceFiles = @($sourceFiles | Select-Object -Unique)
+        }
+    }
+
+    $series = New-Object System.Collections.Generic.List[object]
+    $allTimes = New-Object System.Collections.Generic.List[int]
+    foreach ($entry in $seriesMap.GetEnumerator()) {
+        $points = @(
+            foreach ($timeKey in ($entry.Value.PointsByTime.Keys | ForEach-Object { [int]$_ } | Sort-Object)) {
+                $allTimes.Add($timeKey)
+                [pscustomobject]@{
+                    TimeMs = $timeKey
+                    Value = [double]$entry.Value.PointsByTime[[string]$timeKey]
+                }
+            }
+        )
+
+        $values = @($points | ForEach-Object { $_.Value })
+        $series.Add([pscustomobject]@{
+            Key = $entry.Value.Key
+            Label = $entry.Value.Label
+            Metric = $entry.Value.Metric
+            Direction = $entry.Value.Direction
+            Unit = $entry.Value.Unit
+            PreferredDecimals = $entry.Value.PreferredDecimals
+            Points = $points
+            Summary = [pscustomobject]@{
+                Min = if ($values.Count -gt 0) { ($values | Measure-Object -Minimum).Minimum } else { 0 }
+                Max = if ($values.Count -gt 0) { ($values | Measure-Object -Maximum).Maximum } else { 0 }
+                Avg = if ($values.Count -gt 0) { ($values | Measure-Object -Average).Average } else { 0 }
+                SampleCount = $values.Count
+            }
+        })
+    }
+
+    $orderedSeries = @($series | Sort-Object Metric, Direction)
+    $orderedTimes = @($allTimes | Sort-Object -Unique)
+    $presentMetricKeys = @($orderedSeries | ForEach-Object { [string]$_.Metric } | Select-Object -Unique)
+    $presentMetrics = @(
+        foreach ($metric in $expectedMetrics) {
+            if ($presentMetricKeys -contains $metric.Key) {
+                $metric.Label
+            }
+        }
+    )
+    $missingMetrics = @(
+        foreach ($metric in $expectedMetrics) {
+            if ($presentMetricKeys -notcontains $metric.Key) {
+                $metric.Label
+            }
+        }
+    )
+    $status = if ($missingMetrics.Count -gt 0) { 'Partial' } else { 'Available' }
+    $message = if ($missingMetrics.Count -gt 0) {
+        'Some diagnostics were captured, but not every telemetry stream was available.'
+    }
+    else {
+        'Windowed throughput, IOPS, and latency diagnostics were captured successfully.'
+    }
+
+    [pscustomobject]@{
+        Available = $true
+        Status = $status
+        Message = $message
+        LogWindowMs = $script:FioDiagnosticsWindowMs
+        TimeRangeMs = if ($orderedTimes.Count -gt 0) { ($orderedTimes | Measure-Object -Maximum).Maximum } else { $null }
+        MissingMetrics = $missingMetrics
+        PresentMetrics = $presentMetrics
+        Series = $orderedSeries
+        SourceFiles = @($sourceFiles | Select-Object -Unique | Sort-Object)
+    }
+}
+
+function Read-FioDiagnosticsLogFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [int]$ValueIndex,
+
+        [Parameter(Mandatory)]
+        [double]$Divisor
+    )
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($line in Get-Content -LiteralPath $Path -ErrorAction Stop) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        $trimmed = $line.Trim()
+        if ($trimmed.StartsWith('#') -or $trimmed.StartsWith(';')) {
+            continue
+        }
+
+        $columns = $trimmed.Split(',')
+        if ($columns.Count -le $ValueIndex) {
+            continue
+        }
+
+        try {
+            $timeMs = [int]::Parse($columns[0], [System.Globalization.CultureInfo]::InvariantCulture)
+            $value = [double]::Parse($columns[$ValueIndex], [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        catch {
+            continue
+        }
+
+        $directionIndex = if ($columns.Count -ge 6) { 3 } elseif ($columns.Count -ge 3) { 2 } else { -1 }
+        try {
+            if ($directionIndex -lt 0 -or $columns.Count -le $directionIndex) {
+                throw 'Missing direction column.'
+            }
+
+            $direction = [int]::Parse($columns[$directionIndex], [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        catch {
+            $direction = 0
+        }
+
+        $rows.Add([pscustomobject]@{
+            TimeMs = $timeMs
+            Value = ($value / $Divisor)
+            Direction = $direction
+        })
+    }
+
+    return $rows.ToArray()
+}
+
+function Export-FioSqlBenchDiagnosticsCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Diagnostics,
+
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    if ($null -ne $Diagnostics -and $Diagnostics.Available) {
+        foreach ($series in @($Diagnostics.Series)) {
+            foreach ($point in @($series.Points)) {
+                $rows.Add([pscustomobject]@{
+                    Metric = $series.Metric
+                    SeriesKey = $series.Key
+                    Label = $series.Label
+                    Direction = $series.Direction
+                    Unit = $series.Unit
+                    TimeMs = $point.TimeMs
+                    TimeSec = [math]::Round(($point.TimeMs / 1000.0), 3)
+                    Value = $point.Value
+                })
+            }
+        }
+    }
+
+    $rows | Export-Csv -Path $Path -NoTypeInformation -Encoding utf8
 }
 
 function Merge-FioOperationStats {
@@ -1369,6 +1788,47 @@ function Get-FioHistoryRunAggregate {
         $null
     }
 
+    $diagnosticIteration = @($Iterations | Where-Object { $_.PSObject.Properties['Diagnostics'] -and $null -ne $_.Diagnostics }) | Select-Object -Last 1
+    $rawDiagnostics = if ($null -ne $diagnosticIteration) { $diagnosticIteration.Diagnostics } else { $null }
+    $diagnosticsRequested = if ($null -ne $rawDiagnostics -and $rawDiagnostics.PSObject.Properties['Requested']) {
+        [bool]$rawDiagnostics.Requested
+    }
+    elseif ($RootSummary.PSObject.Properties['DiagnosticsEnabled']) {
+        [bool]$RootSummary.DiagnosticsEnabled
+    }
+    else {
+        $false
+    }
+
+    $normalizedDiagnostics = if ($null -ne $rawDiagnostics) {
+        [pscustomobject]@{
+            Requested = $diagnosticsRequested
+            Available = [bool]$rawDiagnostics.Available
+            Status = if ($rawDiagnostics.PSObject.Properties['Status']) { [string]$rawDiagnostics.Status } elseif ($rawDiagnostics.Available) { 'Available' } else { 'Unavailable' }
+            Message = if ($rawDiagnostics.PSObject.Properties['Message']) { [string]$rawDiagnostics.Message } elseif ($rawDiagnostics.Available) { 'Windowed diagnostics were captured successfully.' } elseif ($diagnosticsRequested) { 'Diagnostics were requested but no chartable telemetry was retained in this summary.' } else { 'Diagnostics were not requested for this run.' }
+            LogWindowMs = if ($rawDiagnostics.PSObject.Properties['LogWindowMs']) { $rawDiagnostics.LogWindowMs } else { $script:FioDiagnosticsWindowMs }
+            TimeRangeMs = if ($rawDiagnostics.PSObject.Properties['TimeRangeMs']) { $rawDiagnostics.TimeRangeMs } else { $null }
+            MissingMetrics = if ($rawDiagnostics.PSObject.Properties['MissingMetrics']) { @($rawDiagnostics.MissingMetrics) } else { @() }
+            PresentMetrics = if ($rawDiagnostics.PSObject.Properties['PresentMetrics']) { @($rawDiagnostics.PresentMetrics) } else { @() }
+            Series = if ($rawDiagnostics.PSObject.Properties['Series']) { @($rawDiagnostics.Series) } else { @() }
+            SourceFiles = if ($rawDiagnostics.PSObject.Properties['SourceFiles']) { @($rawDiagnostics.SourceFiles) } else { @() }
+        }
+    }
+    else {
+        [pscustomobject]@{
+            Requested = $diagnosticsRequested
+            Available = $false
+            Status = if ($diagnosticsRequested) { 'MissingSummary' } else { 'Disabled' }
+            Message = if ($diagnosticsRequested) { 'Diagnostics were requested for this run, but the historical summary does not retain a diagnostics payload.' } else { 'Diagnostics were not requested for this run.' }
+            LogWindowMs = $script:FioDiagnosticsWindowMs
+            TimeRangeMs = $null
+            MissingMetrics = @()
+            PresentMetrics = @()
+            Series = @()
+            SourceFiles = @()
+        }
+    }
+
     $read = [pscustomobject]@{
         Iops = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.Iops }
         BandwidthMBps = Get-FioHistoricalAverageValue -Items $Iterations -ValueScript { param($item) $item.Read.BandwidthMBps }
@@ -1420,17 +1880,19 @@ function Get-FioHistoryRunAggregate {
         Fsync = if ($first.PSObject.Properties['Fsync']) { [int]$first.Fsync } else { $null }
         Read = $read
         Write = $write
+        Diagnostics = $normalizedDiagnostics
         Iterations = $Iterations
     }
 }
 
 function Import-FioSqlBenchHistory {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidAssignmentToAutomaticVariable', 'Profile', Justification = 'The public function intentionally exposes -Profile.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$ResultsRoot,
 
-        [ValidateSet('Any', 'Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan')]
+        [ValidateSet('Any', 'Data', 'Log', 'Tempdb', 'BackupRestore', 'DbccScan', 'MaxThroughput', 'MaxIOPs')]
         [string]$Profile = 'Any',
 
         [ValidateSet('Any', 'Local', 'Smb')]
@@ -1510,6 +1972,11 @@ function Get-FioHistoricalRollup {
                 TargetType = $sample.TargetType
                 TargetPath = $sample.TargetPath
                 RunCount = $group.Count
+                DiagnosticsRequestedRuns = @($orderedRuns | Where-Object { $_.Diagnostics -and $_.Diagnostics.Requested }).Count
+                DiagnosticsAvailableRuns = @($orderedRuns | Where-Object { $_.Diagnostics -and $_.Diagnostics.Available }).Count
+                DiagnosticsPartialRuns = @($orderedRuns | Where-Object { $_.Diagnostics -and $_.Diagnostics.Status -eq 'Partial' }).Count
+                DiagnosticsMissingRuns = @($orderedRuns | Where-Object { $_.Diagnostics -and $_.Diagnostics.Requested -and -not $_.Diagnostics.Available }).Count
+                LastDiagnosticsStatus = if ($orderedRuns[-1].Diagnostics) { [string]$orderedRuns[-1].Diagnostics.Status } else { 'Disabled' }
                 FirstTimestampUtc = $orderedRuns[0].TimestampUtc
                 LastTimestampUtc = $orderedRuns[-1].TimestampUtc
                 ReadIops = Get-FioHistoricalTriplet -Values @($orderedRuns | ForEach-Object { $_.Read.Iops })
@@ -1562,6 +2029,11 @@ function Export-FioSqlBenchHistoricalCsv {
             ReadWrite = $run.ReadWrite
             ReadMix = $run.ReadMix
             Fsync = $run.Fsync
+            DiagnosticsRequested = if ($run.Diagnostics) { $run.Diagnostics.Requested } else { $false }
+            DiagnosticsStatus = if ($run.Diagnostics) { $run.Diagnostics.Status } else { $null }
+            DiagnosticsMessage = if ($run.Diagnostics) { $run.Diagnostics.Message } else { $null }
+            DiagnosticsSeriesCount = if ($run.Diagnostics -and $run.Diagnostics.Series) { @($run.Diagnostics.Series).Count } else { 0 }
+            DiagnosticsSourceFileCount = if ($run.Diagnostics -and $run.Diagnostics.SourceFiles) { @($run.Diagnostics.SourceFiles).Count } else { 0 }
             ReadIops = $run.Read.Iops
             ReadBandwidthMBps = $run.Read.BandwidthMBps
             ReadMeanLatencyUs = $run.Read.MeanLatencyUs
@@ -1584,6 +2056,432 @@ function Export-FioSqlBenchHistoricalCsv {
     }
 
     $rows | Export-Csv -Path $Path -NoTypeInformation -Encoding utf8
+}
+
+function Get-FioDiagnosticsRenderState {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Diagnostics
+    )
+
+    $requested = $false
+    if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['Requested']) {
+        $requested = [bool]$Diagnostics.Requested
+    }
+
+    $available = $false
+    if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['Available']) {
+        $available = [bool]$Diagnostics.Available
+    }
+
+    $status = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['Status'] -and -not [string]::IsNullOrWhiteSpace([string]$Diagnostics.Status)) {
+        [string]$Diagnostics.Status
+    }
+    elseif ($available) {
+        'Available'
+    }
+    elseif ($requested) {
+        'Unavailable'
+    }
+    else {
+        'Disabled'
+    }
+
+    $missingCount = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['MissingMetrics']) { @($Diagnostics.MissingMetrics).Count } else { 0 }
+    $presentCount = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['PresentMetrics']) { @($Diagnostics.PresentMetrics).Count } else { 0 }
+    $detail = if ($requested) {
+        '{0}/{1} streams' -f $presentCount, ($presentCount + $missingCount)
+    }
+    else {
+        'Not requested'
+    }
+
+    $label = switch ($status) {
+        'Available' { 'Available' }
+        'Partial' { 'Partial' }
+        'MissingLogs' { 'Missing logs' }
+        'Unreadable' { 'Unreadable' }
+        'MissingSummary' { 'Missing summary' }
+        'Unavailable' { 'Unavailable' }
+        default { 'Disabled' }
+    }
+
+    $class = switch ($status) {
+        'Available' { 'diagnostic-state-good' }
+        'Partial' { 'diagnostic-state-warn' }
+        'MissingLogs' { 'diagnostic-state-bad' }
+        'Unreadable' { 'diagnostic-state-bad' }
+        'MissingSummary' { 'diagnostic-state-bad' }
+        'Unavailable' { 'diagnostic-state-bad' }
+        default { 'diagnostic-state-neutral' }
+    }
+
+    return [pscustomobject]@{
+        Requested = $requested
+        Available = $available
+        Status = $status
+        Label = $label
+        Detail = $detail
+        Class = $class
+    }
+}
+
+function Convert-FioHtmlUsToMs {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][double]$Microseconds
+    )
+
+    if ($null -eq $Microseconds) {
+        return $null
+    }
+
+    [math]::Round(($Microseconds / 1000.0), 2)
+}
+
+function Get-FioHtmlAssessmentDisplay {
+    [CmdletBinding()]
+    param(
+        [string]$Status
+    )
+
+    switch ($Status) {
+        'Excellent' { return [pscustomobject]@{ Label = 'Excellent'; Class = 'assessment-excellent'; Rank = 0 } }
+        'Very good' { return [pscustomobject]@{ Label = 'Good'; Class = 'assessment-good'; Rank = 1 } }
+        'Good' { return [pscustomobject]@{ Label = 'Good'; Class = 'assessment-good'; Rank = 2 } }
+        'Watch' { return [pscustomobject]@{ Label = 'Poor'; Class = 'assessment-poor'; Rank = 3 } }
+        'Poor' { return [pscustomobject]@{ Label = 'Poor'; Class = 'assessment-poor'; Rank = 4 } }
+        'Bad' { return [pscustomobject]@{ Label = 'Poor'; Class = 'assessment-poor'; Rank = 5 } }
+        'Deplorable' { return [pscustomobject]@{ Label = 'Poor'; Class = 'assessment-poor'; Rank = 6 } }
+        default { return [pscustomobject]@{ Label = 'No data'; Class = 'assessment-neutral'; Rank = 7 } }
+    }
+}
+
+function Get-FioHtmlGenericLatencyAssessment {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][double]$LatencyMs
+    )
+
+    if ($null -eq $LatencyMs) {
+        return 'No data'
+    }
+
+    if ($LatencyMs -lt 2) { return 'Excellent' }
+    if ($LatencyMs -le 5) { return 'Very good' }
+    if ($LatencyMs -le 15) { return 'Good' }
+    if ($LatencyMs -le 100) { return 'Poor' }
+    if ($LatencyMs -le 500) { return 'Bad' }
+    return 'Deplorable'
+}
+
+function Get-FioHtmlSqlProfileAssessment {
+    [CmdletBinding()]
+    param(
+        [string]$WorkloadProfile,
+        [string]$TargetType,
+        [string]$Operation,
+        [AllowNull()][double]$MeanLatencyMs,
+        [AllowNull()][double]$P99LatencyMs,
+        [AllowNull()][double]$P999LatencyMs,
+        [AllowNull()][double]$WorstP99LatencyMs,
+        [int]$Direct
+    )
+
+    $notes = New-Object System.Collections.Generic.List[string]
+    $status = Get-FioHtmlGenericLatencyAssessment -LatencyMs $MeanLatencyMs
+
+    switch ($WorkloadProfile) {
+        'MaxIOPs' {
+            if ($null -ne $MeanLatencyMs) {
+                if ($TargetType -eq 'Smb') {
+                    if ($MeanLatencyMs -le 4) { $status = 'Excellent' }
+                    elseif ($MeanLatencyMs -le 8) { $status = 'Very good' }
+                    elseif ($MeanLatencyMs -le 15) { $status = 'Good' }
+                    elseif ($MeanLatencyMs -le 30) { $status = 'Watch' }
+                    else { $status = 'Poor' }
+                }
+                elseif ($MeanLatencyMs -le 2) { $status = 'Excellent' }
+                elseif ($MeanLatencyMs -le 5) { $status = 'Very good' }
+                elseif ($MeanLatencyMs -le 10) { $status = 'Good' }
+                elseif ($MeanLatencyMs -le 20) { $status = 'Watch' }
+                else { $status = 'Poor' }
+
+                $notes.Add('MaxIOPs intentionally runs isolated 4K random read and random write phases with aggressive concurrency. Prioritize peak sustained IOPS and stability over OLTP-like mixed-latency targets.')
+            }
+        }
+        'MaxThroughput' {
+            if ($null -ne $MeanLatencyMs) {
+                if ($TargetType -eq 'Smb') {
+                    if ($MeanLatencyMs -le 15) { $status = 'Excellent' }
+                    elseif ($MeanLatencyMs -le 30) { $status = 'Very good' }
+                    elseif ($MeanLatencyMs -le 50) { $status = 'Good' }
+                    elseif ($MeanLatencyMs -le 100) { $status = 'Watch' }
+                    else { $status = 'Poor' }
+                }
+                elseif ($MeanLatencyMs -le 10) { $status = 'Excellent' }
+                elseif ($MeanLatencyMs -le 25) { $status = 'Very good' }
+                elseif ($MeanLatencyMs -le 40) { $status = 'Good' }
+                elseif ($MeanLatencyMs -le 75) { $status = 'Watch' }
+                else { $status = 'Poor' }
+
+                $notes.Add('MaxThroughput intentionally uses large-block sequential I/O and enough concurrency to saturate the path. Throughput and stability matter more here than OLTP-style low latency.')
+            }
+        }
+        'Log' {
+            if ($Operation -eq 'Write' -and $null -ne $MeanLatencyMs) {
+                if ($TargetType -eq 'Smb') {
+                    if ($MeanLatencyMs -le 2) { $status = 'Excellent' }
+                    elseif ($MeanLatencyMs -le 6) { $status = 'Very good' }
+                    elseif ($MeanLatencyMs -le 10) { $status = 'Good' }
+                    elseif ($MeanLatencyMs -le 15) { $status = 'Watch' }
+                    else { $status = 'Poor' }
+                    $notes.Add('SQL over SMB is supported, but all file I/O traverses the network path. Microsoft recommends ensuring adequate bandwidth and SMB 3 continuous availability.')
+                }
+                elseif ($MeanLatencyMs -le 1) { $status = 'Excellent' }
+                elseif ($MeanLatencyMs -le 5) { $status = 'Very good' }
+                elseif ($MeanLatencyMs -le 10) { $status = 'Watch' }
+                elseif ($MeanLatencyMs -le 15) { $status = 'Poor' }
+                else { $status = 'Bad' }
+                $notes.Add('SQL log guidance: well-tuned log writes are typically 1-5 ms, ideally near 1 ms.')
+
+                if ($TargetType -eq 'Local' -and $Direct -eq 0) {
+                    $notes.Add('Local log benchmarking is most SQL-like with direct I/O enabled so buffered filesystem cache does not hide commit latency.')
+                }
+            }
+        }
+        default {
+            if ($null -ne $MeanLatencyMs) {
+                if ($TargetType -eq 'Smb') {
+                    if ($MeanLatencyMs -le 6) { $status = 'Excellent' }
+                    elseif ($MeanLatencyMs -le 12) { $status = 'Very good' }
+                    elseif ($MeanLatencyMs -le 15) { $status = 'Good' }
+                    elseif ($MeanLatencyMs -le 20) { $status = 'Watch' }
+                    else { $status = 'Poor' }
+                    $notes.Add('SMB-backed SQL results include network and file-server effects. Microsoft recommends checking bandwidth, SMB Multichannel, and SMB Direct where available.')
+                }
+                elseif ($MeanLatencyMs -le 5) { $status = 'Excellent' }
+                elseif ($MeanLatencyMs -le 10) { $status = 'Very good' }
+                elseif ($MeanLatencyMs -le 15) { $status = 'Good' }
+                elseif ($MeanLatencyMs -le 20) { $status = 'Watch' }
+                else { $status = 'Poor' }
+                $notes.Add('SQL data guidance: well-tuned data reads and writes are usually under 10 ms, with 4-20 ms as a common tuned range.')
+            }
+        }
+    }
+
+    if ($null -ne $P99LatencyMs) {
+        if ($P99LatencyMs -gt 15) {
+            $current = Get-FioHtmlAssessmentDisplay -Status $status
+            $tail = Get-FioHtmlAssessmentDisplay -Status 'Watch'
+            if ($tail.Rank -gt $current.Rank) {
+                $status = 'Watch'
+            }
+            $notes.Add('Tail latency exceeds the 10-15 ms SQL bottleneck investigation threshold.')
+        }
+        elseif ($P99LatencyMs -gt 10) {
+            $notes.Add('Tail latency is above 10 ms; watch for sustained pressure under production load.')
+        }
+    }
+
+    if ($null -ne $P999LatencyMs) {
+        if ($WorkloadProfile -eq 'Log' -and $Operation -eq 'Write' -and $P999LatencyMs -gt 25) {
+            $status = if ($TargetType -eq 'Smb') { 'Poor' } else { 'Bad' }
+            $notes.Add('P99.9 latency shows severe commit stalls. This is a strong SQL log tail-latency warning sign.')
+        }
+        elseif ($P999LatencyMs -gt 30) {
+            $current = Get-FioHtmlAssessmentDisplay -Status $status
+            $tail = Get-FioHtmlAssessmentDisplay -Status 'Watch'
+            if ($tail.Rank -gt $current.Rank) {
+                $status = 'Watch'
+            }
+            $notes.Add('P99.9 latency indicates deeper tail stalls beyond the P99 view. Treat this as a stability risk for SQL workloads.')
+        }
+    }
+
+    if ($null -ne $WorstP99LatencyMs -and $null -ne $P99LatencyMs -and $WorstP99LatencyMs -gt ($P99LatencyMs * 1.5)) {
+        $notes.Add('One fio worker is materially worse than the composite tail. This suggests queue imbalance or uneven latency across the path.')
+    }
+
+    [pscustomobject]@{
+        Status = $status
+        Notes = @($notes | Select-Object -Unique)
+    }
+}
+
+function Get-FioHtmlOperationAssessmentModel {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Run,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Read', 'Write')]
+        [string]$Operation
+    )
+
+    $stats = if ($Operation -eq 'Read') { $Run.Read } else { $Run.Write }
+    $directMode = if ($Run.PSObject.Properties['Direct']) { [int]$Run.Direct } else { 0 }
+    $meanLatencyUs = if ($stats.PSObject.Properties['MeanLatencyUs']) { $stats.MeanLatencyUs } else { $null }
+    $p99LatencyUs = if ($stats.PSObject.Properties['P99LatencyUs']) { $stats.P99LatencyUs } else { $null }
+    $p999LatencyUs = if ($stats.PSObject.Properties['P999LatencyUs']) { $stats.P999LatencyUs } else { $null }
+    $worstP99LatencyUs = if ($stats.PSObject.Properties['WorstP99LatencyUs']) { $stats.WorstP99LatencyUs } else { $null }
+    $totalIos = if ($stats.PSObject.Properties['TotalIos']) { $stats.TotalIos } else { $null }
+    $bandwidthCvPercent = if ($stats.PSObject.Properties['BandwidthCvPercent']) { $stats.BandwidthCvPercent } else { $null }
+    $iopsCvPercent = if ($stats.PSObject.Properties['IopsCvPercent']) { $stats.IopsCvPercent } else { $null }
+    $meanMs = Convert-FioHtmlUsToMs -Microseconds $meanLatencyUs
+    $p99Ms = Convert-FioHtmlUsToMs -Microseconds $p99LatencyUs
+    $p999Ms = Convert-FioHtmlUsToMs -Microseconds $p999LatencyUs
+    $worstP99Ms = Convert-FioHtmlUsToMs -Microseconds $worstP99LatencyUs
+    $assessment = Get-FioHtmlSqlProfileAssessment -WorkloadProfile ([string]$Run.Profile) -TargetType ([string]$Run.TargetType) -Operation $Operation -MeanLatencyMs $meanMs -P99LatencyMs $p99Ms -P999LatencyMs $p999Ms -WorstP99LatencyMs $worstP99Ms -Direct $directMode
+    $display = Get-FioHtmlAssessmentDisplay -Status $assessment.Status
+
+    [pscustomobject]@{
+        Operation = $Operation
+        Iops = [double]$stats.Iops
+        BandwidthMBps = [double]$stats.BandwidthMBps
+        MeanMs = $meanMs
+        P99Ms = $p99Ms
+        P999Ms = $p999Ms
+        WorstP99Ms = $worstP99Ms
+        TotalIos = $totalIos
+        BandwidthCvPercent = $bandwidthCvPercent
+        IopsCvPercent = $iopsCvPercent
+        RawStatus = $assessment.Status
+        DisplayStatus = $display.Label
+        AssessmentClass = $display.Class
+        AssessmentRank = $display.Rank
+        Notes = @($assessment.Notes)
+    }
+}
+
+function Get-FioHtmlActiveAssessmentRows {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Run
+    )
+
+    $rows = @(
+        Get-FioHtmlOperationAssessmentModel -Run $Run -Operation 'Read'
+        Get-FioHtmlOperationAssessmentModel -Run $Run -Operation 'Write'
+    )
+
+    $activeRows = @(
+        $rows | Where-Object {
+            ($null -ne $_.TotalIos -and $_.TotalIos -gt 0) -or
+            ($null -ne $_.Iops -and $_.Iops -gt 0) -or
+            ($null -ne $_.BandwidthMBps -and $_.BandwidthMBps -gt 0)
+        }
+    )
+
+    if ($activeRows.Count -gt 0) {
+        return $activeRows
+    }
+
+    return $rows
+}
+
+function Get-FioHtmlOverallAssessmentModel {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Run
+    )
+
+    $rows = @(Get-FioHtmlActiveAssessmentRows -Run $Run)
+    $worstRow = @($rows | Sort-Object @{ Expression = { $_.AssessmentRank }; Descending = $true }, @{ Expression = { $_.MeanMs }; Descending = $true } | Select-Object -First 1)[0]
+    if ($null -eq $worstRow) {
+        return [pscustomobject]@{ Label = 'No data'; Class = 'assessment-neutral'; Rank = 7; Operation = $null }
+    }
+
+    [pscustomobject]@{
+        Label = $worstRow.DisplayStatus
+        Class = $worstRow.AssessmentClass
+        Rank = $worstRow.AssessmentRank
+        Operation = $worstRow.Operation
+    }
+}
+
+function Get-FioHtmlProfileTargetText {
+    [CmdletBinding()]
+    param(
+        [string]$WorkloadProfile,
+        [string]$TargetType
+    )
+
+    switch ($WorkloadProfile) {
+        'MaxIOPs' {
+            if ($TargetType -eq 'Smb') {
+                return 'MaxIOPs is a best-case random-I/O profile. It runs isolated 4K randread and randwrite phases over the same files so read and write IOPS can be compared without a mixed-workload split.'
+            }
+
+            return 'MaxIOPs is a best-case random-I/O profile. It runs isolated 4K randread and randwrite phases over the same files so peak read and write IOPS are measured separately under heavy queue depth.'
+        }
+        'MaxThroughput' {
+            if ($TargetType -eq 'Smb') {
+                return 'MaxThroughput is a best-case bandwidth profile. Favor stable large-block MB/s and avoid severe tail stalls while the SMB path is saturated.'
+            }
+
+            return 'MaxThroughput is a best-case bandwidth profile. Favor stable large-block MB/s while accepting higher queueing latency than OLTP-style tests.'
+        }
+        'BackupRestore' {
+            if ($TargetType -eq 'Smb') {
+                return 'Backup and restore over SMB should show stable large-block throughput with latency spikes kept out of sustained operation.'
+            }
+
+            return 'Backup and restore are throughput-led workloads. Look for strong large-block MB/s without sustained double-digit latency.'
+        }
+        'DbccScan' {
+            if ($TargetType -eq 'Smb') {
+                return 'DBCC-like scans over SMB should maintain predictable sequential read throughput while avoiding sustained tail-latency spikes.'
+            }
+
+            return 'DBCC-like scan workloads should keep large-block read latency controlled while favoring consistent throughput.'
+        }
+        'Log' {
+            if ($TargetType -eq 'Smb') {
+                return 'SMB log writes should still trend toward low single-digit ms; 10-15 ms remains the escalation line.'
+            }
+
+            return 'Log writes are best around 1-5 ms.'
+        }
+        default {
+            if ($TargetType -eq 'Smb') {
+                return 'SMB data/tempdb I/O should still stay below 10-15 ms where possible; slightly higher overhead can be normal without SMB Direct.'
+            }
+
+            return 'Data/tempdb I/O is healthiest under 10 ms; 4-20 ms is a common tuned range.'
+        }
+    }
+}
+
+function Get-FioHtmlSqlFitBlurb {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Run
+    )
+
+    $targetText = Get-FioHtmlProfileTargetText -WorkloadProfile ([string]$Run.Profile) -TargetType ([string]$Run.TargetType)
+    $rows = @(Get-FioHtmlActiveAssessmentRows -Run $Run)
+    $focusRow = @($rows | Sort-Object @{ Expression = { $_.AssessmentRank }; Descending = $true }, @{ Expression = { $_.MeanMs }; Descending = $true } | Select-Object -First 1)[0]
+    $focusNote = if ($null -ne $focusRow -and @($focusRow.Notes).Count -gt 0) { [string](@($focusRow.Notes | Select-Object -Unique)[0]) } else { $null }
+
+    if (-not [string]::IsNullOrWhiteSpace($targetText) -and -not [string]::IsNullOrWhiteSpace($focusNote)) {
+        return ('{0} {1}' -f $targetText, $focusNote)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($targetText)) {
+        return $targetText
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($focusNote)) {
+        return $focusNote
+    }
+
+    return 'No SQL-profile interpretation was available for this run.'
 }
 
 function ConvertTo-FioHtmlEncoded {
@@ -1695,12 +2593,14 @@ function Format-FioHtmlDelta {
                 }
             }
 
-            $badges.Add(@"
-    <span class='$className' title='$([System.Net.WebUtility]::HtmlEncode($title))'>
-      <span class='setting-key'>$([System.Net.WebUtility]::HtmlEncode($label))</span>
-      <span class='setting-value'>$([System.Net.WebUtility]::HtmlEncode($value))</span>
-    </span>
-    "@)
+                $badgeHtml = (
+                    '<span class="{0}" title="{1}"><span class="setting-key">{2}</span><span class="setting-value">{3}</span></span>' -f
+                    $className,
+                    [System.Net.WebUtility]::HtmlEncode($title),
+                    [System.Net.WebUtility]::HtmlEncode($label),
+                    [System.Net.WebUtility]::HtmlEncode($value)
+                )
+            $badges.Add($badgeHtml)
         }
 
         if ($badges.Count -eq 0) {
@@ -1714,7 +2614,7 @@ function New-FioHtmlProfileComparisonSection {
         [CmdletBinding()]
         param(
                 [Parameter(Mandatory)]
-                [string]$Profile,
+        [string]$WorkloadProfile,
 
                 [Parameter(Mandatory)]
                 [object[]]$Runs
@@ -1722,10 +2622,10 @@ function New-FioHtmlProfileComparisonSection {
 
         $orderedRuns = @($Runs | Sort-Object TimestampUtc)
         $recentRuns = @($orderedRuns | Select-Object -Last 6)
-        $maxRead = @($recentRuns | ForEach-Object { $_.Read.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
-        $maxWrite = @($recentRuns | ForEach-Object { $_.Write.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
-        if ($null -eq $maxRead -or $maxRead -le 0) { $maxRead = 1 }
-        if ($null -eq $maxWrite -or $maxWrite -le 0) { $maxWrite = 1 }
+        $maxReadBandwidth = @($recentRuns | ForEach-Object { $_.Read.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+        $maxWriteBandwidth = @($recentRuns | ForEach-Object { $_.Write.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
+        if ($null -eq $maxReadBandwidth -or $maxReadBandwidth -le 0) { $maxReadBandwidth = 1 }
+        if ($null -eq $maxWriteBandwidth -or $maxWriteBandwidth -le 0) { $maxWriteBandwidth = 1 }
 
         $rows = New-Object System.Collections.Generic.List[string]
         for ($index = 0; $index -lt $recentRuns.Count; $index++) {
@@ -1735,12 +2635,14 @@ function New-FioHtmlProfileComparisonSection {
                 $writeP99Ms = if ($null -ne $run.Write.P99LatencyUs) { [math]::Round(($run.Write.P99LatencyUs / 1000.0), 2) } else { $null }
                 $previousReadP99Ms = if ($null -ne $previous -and $null -ne $previous.Read.P99LatencyUs) { [math]::Round(($previous.Read.P99LatencyUs / 1000.0), 2) } else { $null }
                 $previousWriteP99Ms = if ($null -ne $previous -and $null -ne $previous.Write.P99LatencyUs) { [math]::Round(($previous.Write.P99LatencyUs / 1000.0), 2) } else { $null }
+                $readIopsDelta = Format-FioHtmlDelta -Current $run.Read.Iops -Previous $(if ($null -ne $previous) { $previous.Read.Iops } else { $null })
+                $writeIopsDelta = Format-FioHtmlDelta -Current $run.Write.Iops -Previous $(if ($null -ne $previous) { $previous.Write.Iops } else { $null })
                 $readDelta = Format-FioHtmlDelta -Current $run.Read.BandwidthMBps -Previous $(if ($null -ne $previous) { $previous.Read.BandwidthMBps } else { $null }) -Suffix ' MB/s'
                 $writeDelta = Format-FioHtmlDelta -Current $run.Write.BandwidthMBps -Previous $(if ($null -ne $previous) { $previous.Write.BandwidthMBps } else { $null }) -Suffix ' MB/s'
                 $readLatencyDelta = Format-FioHtmlDelta -Current $readP99Ms -Previous $previousReadP99Ms -Suffix ' ms' -LowerIsBetter
                 $writeLatencyDelta = Format-FioHtmlDelta -Current $writeP99Ms -Previous $previousWriteP99Ms -Suffix ' ms' -LowerIsBetter
-                $readWidth = [math]::Round((($run.Read.BandwidthMBps / $maxRead) * 100.0), 2)
-                $writeWidth = [math]::Round((($run.Write.BandwidthMBps / $maxWrite) * 100.0), 2)
+                $readWidth = [math]::Round((($run.Read.BandwidthMBps / $maxReadBandwidth) * 100.0), 2)
+                $writeWidth = [math]::Round((($run.Write.BandwidthMBps / $maxWriteBandwidth) * 100.0), 2)
                 $runSettings = @(
                     [pscustomobject]@{ Key = 'BlockSize'; Label = 'bs'; Value = $run.BlockSize }
                     [pscustomobject]@{ Key = 'QueueDepth'; Label = 'qd'; Value = if ($null -ne $run.QueueDepth) { [string]$run.QueueDepth } else { $null } }
@@ -1804,6 +2706,8 @@ function New-FioHtmlProfileComparisonSection {
             </div>
     </td>
     <td>
+        <div>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Read.Iops))) IOPS</div>
+        <div class='delta $($readIopsDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($readIopsDelta.Text)) IOPS</div>
         <div class='metric-cell'>
             <span>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Read.BandwidthMBps -Suffix ' MB/s')))</span>
             <div class='mini-track'><div class='mini-fill throughput-read' style='width: ${readWidth}%'></div></div>
@@ -1811,6 +2715,8 @@ function New-FioHtmlProfileComparisonSection {
         <div class='delta $($readDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($readDelta.Text))</div>
     </td>
     <td>
+        <div>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Write.Iops))) IOPS</div>
+        <div class='delta $($writeIopsDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($writeIopsDelta.Text)) IOPS</div>
         <div class='metric-cell'>
             <span>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Write.BandwidthMBps -Suffix ' MB/s')))</span>
             <div class='mini-track'><div class='mini-fill throughput-write' style='width: ${writeWidth}%'></div></div>
@@ -1833,7 +2739,7 @@ function New-FioHtmlProfileComparisonSection {
 <section class='table-card profile-card'>
     <div class='section-heading'>
         <div>
-            <h2>$([System.Net.WebUtility]::HtmlEncode($Profile))</h2>
+            <h2>$([System.Net.WebUtility]::HtmlEncode($WorkloadProfile))</h2>
             <p>Recent runs for this workload profile, with each row compared against the previous run in the same profile.</p>
         </div>
         <div class='pill'>$($recentRuns.Count) runs shown</div>
@@ -1843,8 +2749,8 @@ function New-FioHtmlProfileComparisonSection {
             <tr>
                 <th>Run Time</th>
                 <th>Target</th>
-                <th>Read Throughput</th>
-                <th>Write Throughput</th>
+                <th>Read Performance</th>
+                <th>Write Performance</th>
                 <th>Read P99</th>
                 <th>Write P99</th>
             </tr>
@@ -1911,6 +2817,1859 @@ function New-FioHtmlBarChartSection {
     return ($lines -join [Environment]::NewLine)
 }
 
+function New-FioHtmlLineChartSection {
+        [CmdletBinding()]
+        param(
+                [Parameter(Mandatory)]
+                [string]$Title,
+
+                [Parameter(Mandatory)]
+                [object[]]$Series,
+
+                [string]$Subtitle,
+
+                [int]$Height = 240
+        )
+
+        $allPoints = @($Series | ForEach-Object { @($_.Points) })
+        if ($allPoints.Count -eq 0) {
+                return @"
+<section class='chart-card diagnostics-card'>
+    <div class='section-heading'>
+        <div>
+            <h2>$([System.Net.WebUtility]::HtmlEncode($Title))</h2>
+            <p>$([System.Net.WebUtility]::HtmlEncode($(if ($Subtitle) { $Subtitle } else { 'No diagnostics captured.' })))</p>
+        </div>
+    </div>
+</section>
+"@
+        }
+
+        $paddingLeft = 50
+        $paddingRight = 18
+        $paddingTop = 14
+        $paddingBottom = 30
+        $width = 900
+        $plotWidth = $width - $paddingLeft - $paddingRight
+        $plotHeight = $Height - $paddingTop - $paddingBottom
+
+        $times = @($allPoints | ForEach-Object { [double]$_.TimeMs })
+        $values = @($allPoints | ForEach-Object { [double]$_.Value })
+        $maxTime = ($times | Measure-Object -Maximum).Maximum
+        $minTime = ($times | Measure-Object -Minimum).Minimum
+        $maxValue = ($values | Measure-Object -Maximum).Maximum
+        $minValue = ($values | Measure-Object -Minimum).Minimum
+        if ($null -eq $maxTime -or $maxTime -le $minTime) { $maxTime = [math]::Max(1, [double]$maxTime) }
+        if ($null -eq $maxValue) { $maxValue = 1 }
+        if ($null -eq $minValue) { $minValue = 0 }
+        if ($maxValue -le $minValue) {
+                if ($maxValue -eq 0) {
+                        $maxValue = 1
+                }
+                else {
+                        $minValue = 0
+                }
+        }
+
+        $gridLines = New-Object System.Collections.Generic.List[string]
+        for ($tick = 0; $tick -lt 5; $tick++) {
+                $ratio = $tick / 4.0
+                $y = [math]::Round($paddingTop + ($plotHeight * $ratio), 2)
+                $gridLines.Add("<line x1='$paddingLeft' y1='$y' x2='$(($paddingLeft + $plotWidth))' y2='$y' class='diagnostic-grid-line' />")
+        }
+
+        $palette = @{
+                'read' = '#0f766e'
+                'write' = '#b45309'
+                'latencyavg-read' = '#2563eb'
+                'latencymax-read' = '#60a5fa'
+                'latencyavg-write' = '#7c3aed'
+                'latencymax-write' = '#c084fc'
+        }
+
+        $seriesMarkup = New-Object System.Collections.Generic.List[string]
+        $legendItems = New-Object System.Collections.Generic.List[string]
+        foreach ($item in $Series) {
+                $metricDirectionKey = '{0}-{1}' -f $item.Metric.ToLowerInvariant(), $item.Direction.ToLowerInvariant()
+                $fallbackKey = $item.Direction.ToLowerInvariant()
+                $color = if ($palette.ContainsKey($metricDirectionKey)) { $palette[$metricDirectionKey] } elseif ($palette.ContainsKey($fallbackKey)) { $palette[$fallbackKey] } else { '#1f2937' }
+                $points = @(
+                        foreach ($point in @($item.Points)) {
+                                $timeValue = [double]$point.TimeMs
+                                $value = [double]$point.Value
+                                $x = if ($maxTime -le $minTime) { $paddingLeft } else { [math]::Round($paddingLeft + ((($timeValue - $minTime) / ($maxTime - $minTime)) * $plotWidth), 2) }
+                                $y = [math]::Round($paddingTop + (1 - (($value - $minValue) / ($maxValue - $minValue))) * $plotHeight, 2)
+                                '{0},{1}' -f $x, $y
+                        }
+                )
+
+                $seriesMarkup.Add("<polyline fill='none' stroke='$color' stroke-width='3' stroke-linejoin='round' stroke-linecap='round' points='$($points -join ' ')' />")
+                $legendItems.Add("<span class='diagnostic-legend-item'><span class='diagnostic-legend-swatch' style='background: $color'></span>$([System.Net.WebUtility]::HtmlEncode([string]$item.Label))</span>")
+        }
+
+        $yTop = Format-FioHtmlMetric -Value $maxValue -Suffix (' ' + $Series[0].Unit) -Decimals $Series[0].PreferredDecimals
+        $yMid = Format-FioHtmlMetric -Value ([math]::Round((($maxValue + $minValue) / 2.0), $Series[0].PreferredDecimals)) -Suffix (' ' + $Series[0].Unit) -Decimals $Series[0].PreferredDecimals
+        $yBottom = Format-FioHtmlMetric -Value $minValue -Suffix (' ' + $Series[0].Unit) -Decimals $Series[0].PreferredDecimals
+        $xStart = '0s'
+        $xEnd = '{0:N0}s' -f ([math]::Round(($maxTime / 1000.0), 0))
+
+        return @"
+<section class='chart-card diagnostics-card'>
+    <div class='section-heading'>
+        <div>
+            <h2>$([System.Net.WebUtility]::HtmlEncode($Title))</h2>
+            <p>$([System.Net.WebUtility]::HtmlEncode($Subtitle))</p>
+        </div>
+    </div>
+    <div class='diagnostic-legend'>
+        $($legendItems -join [Environment]::NewLine)
+    </div>
+    <div class='diagnostic-chart-wrap'>
+        <div class='diagnostic-axis diagnostic-axis-y'>
+            <span>$([System.Net.WebUtility]::HtmlEncode($yTop))</span>
+            <span>$([System.Net.WebUtility]::HtmlEncode($yMid))</span>
+            <span>$([System.Net.WebUtility]::HtmlEncode($yBottom))</span>
+        </div>
+        <svg viewBox='0 0 $width $Height' class='diagnostic-chart' role='img' aria-label='$([System.Net.WebUtility]::HtmlEncode($Title))'>
+            <rect x='$paddingLeft' y='$paddingTop' width='$plotWidth' height='$plotHeight' class='diagnostic-plot-bg' />
+            $($gridLines -join [Environment]::NewLine)
+            $($seriesMarkup -join [Environment]::NewLine)
+        </svg>
+    </div>
+    <div class='diagnostic-axis diagnostic-axis-x'>
+        <span>$xStart</span>
+        <span>$xEnd</span>
+    </div>
+</section>
+"@
+}
+
+function New-FioHtmlDiagnosticsSection {
+        [CmdletBinding()]
+        param(
+                [AllowNull()]
+                [object]$Diagnostics
+        )
+
+        $state = Get-FioDiagnosticsRenderState -Diagnostics $Diagnostics
+        $message = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['Message'] -and -not [string]::IsNullOrWhiteSpace([string]$Diagnostics.Message)) {
+            [string]$Diagnostics.Message
+        }
+        elseif (-not $state.Requested) {
+            'Diagnostics were not requested for this run. Re-run with -EnableLogs to emit windowed throughput, IOPS, and latency logs.'
+        }
+        elseif (-not $state.Available) {
+            'Diagnostics were requested, but no chartable fio telemetry was captured. Check the iteration console log for fio log creation errors.'
+        }
+        else {
+            'Windowed fio telemetry aggregated across per-job logs so throttling, cache warm-up, and transient latency spikes are visible in the report.'
+        }
+
+        $summaryItems = @(
+                [pscustomobject]@{ Label = 'Status'; Value = $state.Label },
+                [pscustomobject]@{ Label = 'Window'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['LogWindowMs']) { '{0} ms' -f $Diagnostics.LogWindowMs } else { '{0} ms' -f $script:FioDiagnosticsWindowMs } },
+                [pscustomobject]@{ Label = 'Duration'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['TimeRangeMs'] -and $null -ne $Diagnostics.TimeRangeMs) { '{0:N1} s' -f ($Diagnostics.TimeRangeMs / 1000.0) } else { '-' } },
+                [pscustomobject]@{ Label = 'Series'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['Series']) { [string](@($Diagnostics.Series).Count) } else { '0' } },
+                [pscustomobject]@{ Label = 'Source files'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['SourceFiles']) { [string](@($Diagnostics.SourceFiles).Count) } else { '0' } }
+        )
+
+        if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['MissingMetrics'] -and @($Diagnostics.MissingMetrics).Count -gt 0) {
+            $summaryItems += [pscustomobject]@{ Label = 'Missing'; Value = (@($Diagnostics.MissingMetrics) -join ', ') }
+        }
+
+        $summaryBadges = @(
+                foreach ($item in $summaryItems) {
+                        "<span class='setting-badge'><span class='setting-key'>$([System.Net.WebUtility]::HtmlEncode($item.Label))</span><span class='setting-value'>$([System.Net.WebUtility]::HtmlEncode($item.Value))</span></span>"
+                }
+        )
+
+        $notice = "<div class='diagnostic-notice $($state.Class)'><strong>$([System.Net.WebUtility]::HtmlEncode($state.Label)):</strong> $([System.Net.WebUtility]::HtmlEncode($message))</div>"
+
+        if ($null -eq $Diagnostics -or -not $Diagnostics.Available) {
+                return @"
+<section class='table-card diagnostics-card'>
+    <div class='section-heading'>
+        <div>
+            <h2>Diagnostics</h2>
+            <p>Diagnostics state and collection health for this run.</p>
+        </div>
+    </div>
+    <div class='settings-badges'>
+        $($summaryBadges -join [Environment]::NewLine)
+    </div>
+    $notice
+</section>
+"@
+        }
+
+        $throughputSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidth' })
+        $iopsSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'iops' })
+        $latencySeries = @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' })
+        $cards = New-Object System.Collections.Generic.List[string]
+        $cards.Add((New-FioHtmlLineChartSection -Title 'Throughput Over Time' -Series $throughputSeries -Subtitle ('Windowed fio bandwidth logs sampled every {0} ms.' -f $Diagnostics.LogWindowMs)))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'IOPS Over Time' -Series $iopsSeries -Subtitle ('Windowed fio IOPS logs sampled every {0} ms.' -f $Diagnostics.LogWindowMs)))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'Completion Latency Over Time' -Series $latencySeries -Subtitle ('Average and max completion latency from fio clat logs, useful for spotting stalls and throttling.' -f $Diagnostics.LogWindowMs)))
+
+        return @"
+<section class='table-card diagnostics-card'>
+    <div class='section-heading'>
+        <div>
+            <h2>Diagnostics</h2>
+            <p>Diagnostics state and chartable fio telemetry for this run.</p>
+        </div>
+    </div>
+    <div class='settings-badges'>
+        $($summaryBadges -join [Environment]::NewLine)
+    </div>
+    $notice
+    <div class='chart-grid diagnostics-grid'>
+        $($cards -join [Environment]::NewLine)
+    </div>
+</section>
+"@
+}
+
+function Get-FioDiagnosticsSeriesColor {
+    [CmdletBinding()]
+    param(
+        [string]$Metric,
+        [string]$Direction
+    )
+
+    switch ('{0}-{1}' -f $Metric.ToLowerInvariant(), $Direction.ToLowerInvariant()) {
+        'bandwidth-read' { return '#0f766e' }
+        'bandwidth-write' { return '#b45309' }
+        'iops-read' { return '#0f766e' }
+        'iops-write' { return '#b45309' }
+        'latencyavg-read' { return '#2563eb' }
+        'latencymax-read' { return '#60a5fa' }
+        'latencyavg-write' { return '#7c3aed' }
+        'latencymax-write' { return '#c084fc' }
+        default { return '#1f2937' }
+    }
+}
+
+function Get-FioDiagnosticsChartSampleTimes {
+    [CmdletBinding()]
+    param(
+        [int[]]$Times,
+
+        [int]$MaxPoints = 24
+    )
+
+    if ($null -eq $Times -or $Times.Count -eq 0) {
+        return @()
+    }
+
+    if ($Times.Count -le $MaxPoints) {
+        return @($Times)
+    }
+
+    $targetDivisor = [math]::Max(($MaxPoints - 1), 1)
+    $step = [math]::Max([int][math]::Ceiling(($Times.Count - 1) / [double]$targetDivisor), 1)
+    $sampleTimes = New-Object System.Collections.Generic.List[int]
+    for ($index = 0; $index -lt $Times.Count; $index++) {
+        $isEdge = $index -eq 0 -or $index -eq ($Times.Count - 1)
+        if ($isEdge -or ($index % $step -eq 0)) {
+            $sampleTimes.Add([int]$Times[$index])
+        }
+    }
+
+    return @($sampleTimes.ToArray() | Sort-Object -Unique)
+}
+
+function Get-FioDiagnosticsChartModels {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Diagnostics
+    )
+
+    if ($null -eq $Diagnostics -or -not $Diagnostics.Available -or @($Diagnostics.Series).Count -eq 0) {
+        return @()
+    }
+
+    $definitions = @(
+        [pscustomobject]@{ Key = 'bandwidth'; Title = 'Throughput Over Time'; Subtitle = 'Windowed fio bandwidth samples across the selected run.'; YAxisTitle = 'MB/s' }
+        [pscustomobject]@{ Key = 'iops'; Title = 'IOPS Over Time'; Subtitle = 'Windowed fio IOPS samples across the selected run.'; YAxisTitle = 'IOPS' }
+        [pscustomobject]@{ Key = 'latency'; Title = 'Completion Latency Over Time'; Subtitle = 'Average and max completion latency, useful for spotting stalls and throttling.'; YAxisTitle = 'Milliseconds' }
+    )
+
+    $models = New-Object System.Collections.Generic.List[object]
+    foreach ($definition in $definitions) {
+        $metricSeries = if ($definition.Key -eq 'latency') {
+            @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' })
+        }
+        else {
+            @($Diagnostics.Series | Where-Object { $_.Metric -eq $definition.Key })
+        }
+
+        if ($metricSeries.Count -eq 0) {
+            continue
+        }
+
+        $times = @($metricSeries | ForEach-Object { @($_.Points) } | ForEach-Object { [int]$_.TimeMs } | Sort-Object -Unique)
+        $chartTimes = @(Get-FioDiagnosticsChartSampleTimes -Times $times)
+        $categories = @($chartTimes | ForEach-Object { '{0:0.##}s' -f ($_ / 1000.0) })
+        $seriesRows = New-Object System.Collections.Generic.List[object]
+        foreach ($series in $metricSeries) {
+            $pointMap = @{}
+            foreach ($point in @($series.Points)) {
+                $pointMap[[int]$point.TimeMs] = [double]$point.Value
+            }
+
+            $values = @(
+                foreach ($time in $chartTimes) {
+                    if ($pointMap.ContainsKey($time)) {
+                        [math]::Round([double]$pointMap[$time], 4)
+                    }
+                    else {
+                        $null
+                    }
+                }
+            )
+
+            $seriesRows.Add([pscustomobject]@{
+                Name = [string]$series.Label
+                Color = Get-FioDiagnosticsSeriesColor -Metric ([string]$series.Metric) -Direction ([string]$series.Direction)
+                Values = $values
+            })
+        }
+
+        $pointRows = @(
+            foreach ($time in $times) {
+                $row = [ordered]@{
+                    TimeSec = [math]::Round(($time / 1000.0), 3)
+                }
+
+                foreach ($series in $metricSeries) {
+                    $matchingPoint = @($series.Points | Where-Object { [int]$_.TimeMs -eq $time } | Select-Object -First 1)
+                    $pointValue = $null
+                    if ($matchingPoint.Count -gt 0) {
+                        $pointValue = [math]::Round([double]$matchingPoint[0].Value, 4)
+                    }
+
+                    $row[[string]$series.Label] = $pointValue
+                }
+
+                [pscustomobject]$row
+            }
+        )
+
+        $models.Add([pscustomobject]@{
+            Key = $definition.Key
+            Title = $definition.Title
+            Subtitle = $definition.Subtitle
+            YAxisTitle = $definition.YAxisTitle
+            Categories = [string[]]$categories
+            Series = $seriesRows.ToArray()
+            PointRows = @($pointRows)
+        })
+    }
+
+    return $models.ToArray()
+}
+
+function Export-FioSqlBenchHtmlReportStatic {
+        [CmdletBinding()]
+        param(
+                [Parameter(Mandatory)]
+                [object[]]$Runs,
+
+                [Parameter(Mandatory)]
+                [string]$Path,
+
+                [string]$Title = 'fio SQL Bench Report',
+
+                [string]$ResultsRoot,
+
+                [object[]]$Rollups
+        )
+
+        function local:ConvertToHtmlText {
+                param([AllowNull()][object]$Value)
+
+                if ($null -eq $Value) {
+                        return '-'
+                }
+
+                $text = [string]$Value
+                if ([string]::IsNullOrWhiteSpace($text)) {
+                        return '-'
+                }
+
+                return [System.Net.WebUtility]::HtmlEncode($text)
+        }
+
+        function local:NewHtmlTableMarkup {
+                param(
+                        [object[]]$Rows,
+                        [string]$TableClass = 'report-table'
+                )
+
+                if ($null -eq $Rows -or $Rows.Count -eq 0) {
+                        return "<div class='empty-state'>No rows to display.</div>"
+                }
+
+                $headers = @($Rows[0].PSObject.Properties | ForEach-Object { $_.Name })
+                $headerHtml = ($headers | ForEach-Object { '<th>{0}</th>' -f (ConvertToHtmlText $_) }) -join ''
+                $rowHtml = New-Object System.Collections.Generic.List[string]
+                foreach ($row in $Rows) {
+                        $cells = foreach ($header in $headers) {
+                                $value = $row.PSObject.Properties[$header].Value
+                                '<td>{0}</td>' -f (ConvertToHtmlText $value)
+                        }
+                        $rowHtml.Add('<tr>{0}</tr>' -f ($cells -join ''))
+                }
+
+                return @"
+<div class='table-shell'>
+        <table class='$TableClass'>
+                <thead>
+                        <tr>$headerHtml</tr>
+                </thead>
+                <tbody>
+                        $($rowHtml -join [Environment]::NewLine)
+                </tbody>
+        </table>
+</div>
+"@
+        }
+
+        function local:NewCollapsibleTableMarkup {
+                param(
+                        [string]$Title,
+                        [object[]]$Rows
+                )
+
+                $rowCount = if ($null -ne $Rows) { $Rows.Count } else { 0 }
+                $tableMarkup = NewHtmlTableMarkup -Rows $Rows -TableClass 'report-table report-table-compact'
+                return @"
+<details class='collapsible-table'>
+        <summary>$([System.Net.WebUtility]::HtmlEncode($Title)) ($rowCount rows)</summary>
+        $tableMarkup
+</details>
+"@
+        }
+
+    function local:NewCollapsibleSectionMarkup {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Id,
+
+            [Parameter(Mandatory)]
+            [string]$Title,
+
+            [Parameter(Mandatory)]
+            [string]$Description,
+
+            [string]$BadgeText,
+
+            [Parameter(Mandatory)]
+            [string]$InnerHtml,
+
+            [switch]$Open
+        )
+
+        return @"
+<details id='$([System.Net.WebUtility]::HtmlEncode($Id))' class='section-toggle section-card'$(if ($Open) { ' open' })>
+    <summary>
+        <div class='section-toggle-head'>
+            <div>
+                <h2>$([System.Net.WebUtility]::HtmlEncode($Title))</h2>
+                <p>$([System.Net.WebUtility]::HtmlEncode($Description))</p>
+            </div>
+            $(if (-not [string]::IsNullOrWhiteSpace($BadgeText)) { "<div class='pill'>$([System.Net.WebUtility]::HtmlEncode($BadgeText))</div>" } else { '' })
+        </div>
+    </summary>
+    <div class='section-toggle-body'>
+        $InnerHtml
+    </div>
+</details>
+"@
+    }
+
+        function local:GetDiagnosticsSeriesByKey {
+                param(
+                        [object]$Diagnostics,
+                        [string]$Key
+                )
+
+                if ($null -eq $Diagnostics -or $null -eq $Diagnostics.Series) {
+                        return @()
+                }
+
+                switch ($Key) {
+                        'bandwidth' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidth' }) }
+                        'iops' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'iops' }) }
+                        'latency' { return @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' }) }
+                        default { return @() }
+                }
+        }
+
+            function local:GetProfileFocusMetadata {
+                param(
+                    [string]$Profile
+                )
+
+                switch ($Profile) {
+                    'MaxIOPs' {
+                        return [pscustomobject]@{
+                            Category = 'Iops'
+                            Label = 'Peak IOPS'
+                        }
+                    }
+                    'Data' {
+                        return [pscustomobject]@{
+                            Category = 'Iops'
+                            Label = 'Mixed IOPS'
+                        }
+                    }
+                    'Tempdb' {
+                        return [pscustomobject]@{
+                            Category = 'Iops'
+                            Label = 'Scratch IOPS'
+                        }
+                    }
+                    'Log' {
+                        return [pscustomobject]@{
+                            Category = 'Latency'
+                            Label = 'Write latency'
+                        }
+                    }
+                    'BackupRestore' {
+                        return [pscustomobject]@{
+                            Category = 'Throughput'
+                            Label = 'Backup throughput'
+                        }
+                    }
+                    'DbccScan' {
+                        return [pscustomobject]@{
+                            Category = 'Throughput'
+                            Label = 'Scan throughput'
+                        }
+                    }
+                    'MaxThroughput' {
+                        return [pscustomobject]@{
+                            Category = 'Throughput'
+                            Label = 'Peak throughput'
+                        }
+                    }
+                    default {
+                        return [pscustomobject]@{
+                            Category = 'Throughput'
+                            Label = 'General throughput'
+                        }
+                    }
+                }
+            }
+
+            function local:GetOperationFocusMetricModel {
+                param(
+                    [Parameter(Mandatory)]
+                    [object]$Run,
+
+                    [Parameter(Mandatory)]
+                    [string]$Operation,
+
+                    [Parameter(Mandatory)]
+                    [object]$Focus
+                )
+
+                $stats = if ($Operation -eq 'Read') { $Run.Read } else { $Run.Write }
+                $bandwidthText = '{0:N2} MB/s' -f [double]$stats.BandwidthMBps
+                $iopsText = '{0:N0} IOPS' -f [double]$stats.Iops
+                $p99Ms = if ($null -ne $stats.P99LatencyUs) { '{0:N2} ms' -f ($stats.P99LatencyUs / 1000.0) } else { '-' }
+
+                switch ($Focus.Category) {
+                    'Iops' {
+                        return [pscustomobject]@{
+                            Label = ('{0} IOPS' -f $Operation)
+                            Primary = $iopsText
+                            Secondary = $bandwidthText
+                        }
+                    }
+                    'Latency' {
+                        return [pscustomobject]@{
+                            Label = ('{0} p99' -f $Operation)
+                            Primary = $p99Ms
+                            Secondary = $iopsText
+                        }
+                    }
+                    default {
+                        return [pscustomobject]@{
+                            Label = ('{0} throughput' -f $Operation)
+                            Primary = $bandwidthText
+                            Secondary = $iopsText
+                        }
+                    }
+                }
+            }
+
+        if ($Runs.Count -eq 0) {
+                throw 'Cannot build an HTML report without any runs.'
+        }
+
+        $orderedRuns = @($Runs | Sort-Object TimestampUtc)
+        $latestRun = @($orderedRuns | Sort-Object TimestampUtc -Descending | Select-Object -First 1)[0]
+        $rollupRows = if ($null -ne $Rollups) { @($Rollups) } else { @(Get-FioHistoricalRollup -Runs $orderedRuns) }
+        $profileGroups = @($orderedRuns | Group-Object Profile | Sort-Object Name)
+        $profileLatestRuns = @(
+                foreach ($profileGroup in $profileGroups) {
+                        @($profileGroup.Group | Sort-Object TimestampUtc -Descending | Select-Object -First 1)[0]
+                }
+        )
+        $profileDiagnosticsSelections = @(
+                foreach ($profileGroup in $profileGroups) {
+                        $candidateRuns = @($profileGroup.Group | Sort-Object TimestampUtc -Descending)
+                        $selectedDiagnosticsRun = @($candidateRuns | Where-Object { $_.Diagnostics -and $_.Diagnostics.Available } | Select-Object -First 1)[0]
+                        if ($null -eq $selectedDiagnosticsRun) {
+                                $selectedDiagnosticsRun = @($candidateRuns | Where-Object { $_.Diagnostics -and $_.Diagnostics.Requested } | Select-Object -First 1)[0]
+                        }
+                        if ($null -eq $selectedDiagnosticsRun) {
+                                $selectedDiagnosticsRun = $candidateRuns[0]
+                        }
+
+                        [pscustomobject]@{
+                                Profile = [string]$profileGroup.Name
+                                Run = $selectedDiagnosticsRun
+                                State = Get-FioDiagnosticsRenderState -Diagnostics $selectedDiagnosticsRun.Diagnostics
+                                TotalRuns = $candidateRuns.Count
+                                AvailableRuns = @($candidateRuns | Where-Object { $_.Diagnostics -and $_.Diagnostics.Available }).Count
+                                RequestedRuns = @($candidateRuns | Where-Object { $_.Diagnostics -and $_.Diagnostics.Requested }).Count
+                        }
+                }
+        )
+
+        $diagnosticsReadyProfiles = @($profileDiagnosticsSelections | Where-Object { $_.State.Available }).Count
+        $iopsFocusedLatestRuns = @($profileLatestRuns | Where-Object { (GetProfileFocusMetadata -Profile ([string]$_.Profile)).Category -eq 'Iops' })
+        if ($iopsFocusedLatestRuns.Count -eq 0) {
+            $iopsFocusedLatestRuns = $profileLatestRuns
+        }
+        $throughputFocusedLatestRuns = @($profileLatestRuns | Where-Object { (GetProfileFocusMetadata -Profile ([string]$_.Profile)).Category -eq 'Throughput' })
+        if ($throughputFocusedLatestRuns.Count -eq 0) {
+            $throughputFocusedLatestRuns = $profileLatestRuns
+        }
+        $bestReadIopsProfileRun = @($iopsFocusedLatestRuns | Sort-Object { [double]$_.Read.Iops } -Descending | Select-Object -First 1)[0]
+        $bestWriteIopsProfileRun = @($iopsFocusedLatestRuns | Sort-Object { [double]$_.Write.Iops } -Descending | Select-Object -First 1)[0]
+        $bestReadThroughputProfileRun = @($throughputFocusedLatestRuns | Sort-Object { [double]$_.Read.BandwidthMBps } -Descending | Select-Object -First 1)[0]
+        $bestWriteThroughputProfileRun = @($throughputFocusedLatestRuns | Sort-Object { [double]$_.Write.BandwidthMBps } -Descending | Select-Object -First 1)[0]
+        $lowestMeanLatencyResult = @(
+            foreach ($run in $profileLatestRuns) {
+                foreach ($row in @(Get-FioHtmlActiveAssessmentRows -Run $run | Where-Object { $null -ne $_.MeanMs -and $_.MeanMs -gt 0 })) {
+                    [pscustomobject]@{
+                        Profile = [string]$run.Profile
+                        Operation = [string]$row.Operation
+                        MeanMs = [double]$row.MeanMs
+                        Assessment = [string]$row.DisplayStatus
+                    }
+                }
+            }
+        )
+        $lowestMeanLatencyResult = @($lowestMeanLatencyResult | Sort-Object MeanMs, Profile | Select-Object -First 1)[0]
+        $newestProfileSnapshot = @($profileLatestRuns | Sort-Object TimestampUtc -Descending | Select-Object -First 1)[0]
+
+        $heroMetricCards = @(
+                [pscustomobject]@{ Label = 'Profiles represented'; Value = [string]$profileLatestRuns.Count }
+                [pscustomobject]@{ Label = 'Captured runs'; Value = [string]$orderedRuns.Count }
+                [pscustomobject]@{ Label = 'Diagnostics-ready'; Value = [string]$diagnosticsReadyProfiles }
+                [pscustomobject]@{ Label = 'Latest captured'; Value = (Format-FioHtmlTimestamp -TimestampUtc $latestRun.TimestampUtc) }
+        )
+
+        $heroMetricsHtml = foreach ($metric in $heroMetricCards) {
+                @"
+<article class='metric-card'>
+        <div class='metric-label'>$([System.Net.WebUtility]::HtmlEncode([string]$metric.Label))</div>
+        <div class='metric-value'>$([System.Net.WebUtility]::HtmlEncode([string]$metric.Value))</div>
+</article>
+"@
+        }
+
+        $bestReadIopsProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestReadIopsProfileRun.Profile)
+        $bestReadIopsValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N0} IOPS' -f [double]$bestReadIopsProfileRun.Read.Iops))
+        $bestWriteIopsProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestWriteIopsProfileRun.Profile)
+        $bestWriteIopsValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N0} IOPS' -f [double]$bestWriteIopsProfileRun.Write.Iops))
+        $bestReadThroughputProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestReadThroughputProfileRun.Profile)
+        $bestReadThroughputValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$bestReadThroughputProfileRun.Read.BandwidthMBps))
+        $bestWriteThroughputProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestWriteThroughputProfileRun.Profile)
+        $bestWriteThroughputValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$bestWriteThroughputProfileRun.Write.BandwidthMBps))
+        $lowestLatencyContextHtml = [System.Net.WebUtility]::HtmlEncode(('{0} - {1}' -f $lowestMeanLatencyResult.Profile, $lowestMeanLatencyResult.Operation))
+        $lowestLatencyValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$lowestMeanLatencyResult.MeanMs))
+        $lowestLatencyAssessmentHtml = [System.Net.WebUtility]::HtmlEncode([string]$lowestMeanLatencyResult.Assessment)
+
+        $highlightHtml = @(
+            @'
+    <article class="highlight-card">
+        <div class="metric-label">IOPS Leaders</div>
+        <div class="highlight-stat-grid">
+            <div class="highlight-stat">
+                <div class="highlight-stat-label tone-read">Max Read IOPS</div>
+                <div class="highlight-stat-context">{0}</div>
+                <div class="highlight-metric tone-read">{1}</div>
+            </div>
+            <div class="highlight-stat">
+                <div class="highlight-stat-label tone-write">Max Write IOPS</div>
+                <div class="highlight-stat-context">{2}</div>
+                <div class="highlight-metric tone-write">{3}</div>
+            </div>
+        </div>
+    </article>
+'@ -f $bestReadIopsProfileHtml, $bestReadIopsValueHtml, $bestWriteIopsProfileHtml, $bestWriteIopsValueHtml
+            @'
+    <article class="highlight-card">
+        <div class="metric-label">Throughput Leaders</div>
+        <div class="highlight-stat-grid">
+            <div class="highlight-stat">
+                <div class="highlight-stat-label tone-read">Max Read Throughput</div>
+                <div class="highlight-stat-context">{0}</div>
+                <div class="highlight-metric tone-read">{1}</div>
+            </div>
+            <div class="highlight-stat">
+                <div class="highlight-stat-label tone-write">Max Write Throughput</div>
+                <div class="highlight-stat-context">{2}</div>
+                <div class="highlight-metric tone-write">{3}</div>
+            </div>
+        </div>
+    </article>
+'@ -f $bestReadThroughputProfileHtml, $bestReadThroughputValueHtml, $bestWriteThroughputProfileHtml, $bestWriteThroughputValueHtml
+            @'
+    <article class="highlight-card">
+        <div class="metric-label">Latency Leader</div>
+        <div class="highlight-stat highlight-stat-single">
+            <div class="highlight-stat-label">Lowest Mean Latency</div>
+            <div class="highlight-stat-context">{0}</div>
+            <div class="highlight-metric">{1}</div>
+            <div class="highlight-secondary">{2} assessment on current mean latency</div>
+        </div>
+    </article>
+'@ -f $lowestLatencyContextHtml, $lowestLatencyValueHtml, $lowestLatencyAssessmentHtml
+        )
+
+        $latestByProfileHtml = foreach ($run in @($profileLatestRuns | Sort-Object Profile)) {
+                $diagState = Get-FioDiagnosticsRenderState -Diagnostics $run.Diagnostics
+                $focus = GetProfileFocusMetadata -Profile ([string]$run.Profile)
+            $assessment = Get-FioHtmlOverallAssessmentModel -Run $run
+            $sqlFitBlurb = Get-FioHtmlSqlFitBlurb -Run $run
+                $readMetricModel = GetOperationFocusMetricModel -Run $run -Operation 'Read' -Focus $focus
+                $writeMetricModel = GetOperationFocusMetricModel -Run $run -Operation 'Write' -Focus $focus
+            $channelCount = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.MultichannelPathCount) { [int]$run.SmbMetadata.MultichannelPathCount } else { $null }
+            $rdmaCount = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.RdmaPathCount) { [int]$run.SmbMetadata.RdmaPathCount } else { $null }
+            $profileDetailSettings = @(
+                [pscustomobject]@{ Key = 'BlockSize'; Label = 'bs'; Value = [string]$run.BlockSize }
+                [pscustomobject]@{ Key = 'QueueDepth'; Label = 'qd'; Value = if ($null -ne $run.QueueDepth) { [string]$run.QueueDepth } else { $null } }
+                [pscustomobject]@{ Key = 'NumJobs'; Label = 'jobs'; Value = if ($null -ne $run.NumJobs) { [string]$run.NumJobs } else { $null } }
+                [pscustomobject]@{ Key = 'FileSizeGB'; Label = 'size'; Value = if ($null -ne $run.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$run.FileSizeGB, 0)) } else { $null } }
+                [pscustomobject]@{ Key = 'Iterations'; Label = 'iters'; Value = if ($null -ne $run.IterationCount) { [string]$run.IterationCount } else { $null } }
+                [pscustomobject]@{ Key = 'FioVersion'; Label = 'fio'; Value = [string]$run.FioVersion }
+                [pscustomobject]@{ Key = 'Server'; Label = 'server'; Value = if ($run.SmbMetadata) { [string]$run.SmbMetadata.ServerName } else { $null } }
+                [pscustomobject]@{ Key = 'Share'; Label = 'share'; Value = if ($run.SmbMetadata) { [string]$run.SmbMetadata.ShareName } else { $null } }
+                [pscustomobject]@{ Key = 'Channels'; Label = 'channels'; Value = if ($null -ne $channelCount -and $channelCount -gt 0) { [string]$channelCount } else { $null } }
+                [pscustomobject]@{ Key = 'Rdma'; Label = 'rdma'; Value = if ($null -ne $rdmaCount -and $rdmaCount -gt 0) { [string]$rdmaCount } else { $null } }
+                [pscustomobject]@{ Key = 'TargetType'; Label = 'type'; Value = if (-not $run.SmbMetadata) { [string]$run.TargetType } else { $null } }
+            )
+            $profileDetailBadges = ConvertTo-FioHtmlSettingBadges -Settings $profileDetailSettings
+                $statusClass = switch ($diagState.Status) {
+                        'Available' { 'diag-good' }
+                        'Partial' { 'diag-warn' }
+                        'MissingLogs' { 'diag-bad' }
+                        'Unreadable' { 'diag-bad' }
+                        'MissingSummary' { 'diag-bad' }
+                        'Unavailable' { 'diag-bad' }
+                        default { 'diag-neutral' }
+                }
+                $readP99Number = if ($null -ne $run.Read.P99LatencyUs) { '{0:N2}' -f ($run.Read.P99LatencyUs / 1000.0) } else { '-' }
+                $writeP99Number = if ($null -ne $run.Write.P99LatencyUs) { '{0:N2}' -f ($run.Write.P99LatencyUs / 1000.0) } else { '-' }
+                $readP99Unit = if ($null -ne $run.Read.P99LatencyUs) { 'ms' } else { $null }
+                $writeP99Unit = if ($null -ne $run.Write.P99LatencyUs) { 'ms' } else { $null }
+                $readLatencyClassSuffix = if ($null -eq $readP99Unit) { ' profile-latency-stat-empty' } else { '' }
+                $writeLatencyClassSuffix = if ($null -eq $writeP99Unit) { ' profile-latency-stat-empty' } else { '' }
+                $readP99UnitHtml = if ($null -ne $readP99Unit) { '<span class=''profile-latency-unit''>{0}</span>' -f [System.Net.WebUtility]::HtmlEncode($readP99Unit) } else { '' }
+                $writeP99UnitHtml = if ($null -ne $writeP99Unit) { '<span class=''profile-latency-unit''>{0}</span>' -f [System.Net.WebUtility]::HtmlEncode($writeP99Unit) } else { '' }
+                $profileNameHtml = [System.Net.WebUtility]::HtmlEncode([string]$run.Profile)
+                $profileStampHtml = [System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $run.TimestampUtc))
+                $diagnosticAnchorHtml = [System.Net.WebUtility]::HtmlEncode(('diagnostics-{0}' -f ([string]$run.Profile).ToLowerInvariant()))
+                $focusLabelHtml = [System.Net.WebUtility]::HtmlEncode([string]$focus.Label)
+                $assessmentClass = [string]$assessment.Class
+                $assessmentLabelHtml = [System.Net.WebUtility]::HtmlEncode([string]$assessment.Label)
+                $targetTextHtml = [System.Net.WebUtility]::HtmlEncode(('{0} · {1}' -f $run.TargetType, $run.TargetPath))
+                $readLabelHtml = [System.Net.WebUtility]::HtmlEncode([string]$readMetricModel.Label)
+                $readPrimaryHtml = [System.Net.WebUtility]::HtmlEncode([string]$readMetricModel.Primary)
+                $readSecondaryHtml = [System.Net.WebUtility]::HtmlEncode([string]$readMetricModel.Secondary)
+                $writeLabelHtml = [System.Net.WebUtility]::HtmlEncode([string]$writeMetricModel.Label)
+                $writePrimaryHtml = [System.Net.WebUtility]::HtmlEncode([string]$writeMetricModel.Primary)
+                $writeSecondaryHtml = [System.Net.WebUtility]::HtmlEncode([string]$writeMetricModel.Secondary)
+                $readP99NumberHtml = [System.Net.WebUtility]::HtmlEncode([string]$readP99Number)
+                $writeP99NumberHtml = [System.Net.WebUtility]::HtmlEncode([string]$writeP99Number)
+                $diagnosticsDetailHtml = [System.Net.WebUtility]::HtmlEncode([string]$diagState.Detail)
+                $sqlFitBlurbHtml = [System.Net.WebUtility]::HtmlEncode([string]$sqlFitBlurb)
+                @'
+<article class="profile-card">
+        <div class="profile-card-head">
+                <div>
+                        <h3>{0}</h3>
+                        <div class="profile-stamp">{1}</div>
+                        <a class="profile-jump-link" href="#{2}">Jump to diagnostics</a>
+                </div>
+        <div class="profile-card-badges">
+            <span class="focus-pill">{3}</span>
+            <span class="assessment-pill {4}">{5}</span>
+        </div>
+        </div>
+        <div class="profile-target">{6}</div>
+        <div class="profile-detail-badges">
+            {7}
+        </div>
+        <div class="profile-metric-grid">
+            <div class="profile-metric profile-metric-primary">
+            <span class="profile-metric-label">{8}</span>
+            <span class="profile-metric-value">{9}</span>
+            <span class="profile-metric-note">{10}</span>
+                </div>
+            <div class="profile-metric profile-metric-primary">
+            <span class="profile-metric-label">{11}</span>
+            <span class="profile-metric-value">{12}</span>
+            <span class="profile-metric-note">{13}</span>
+                </div>
+            <div class="profile-metric profile-metric-latency">
+                        <span class="profile-metric-label">Latency envelope</span>
+                    <div class="profile-latency-grid">
+                        <div class="profile-latency-stat{14}">
+                            <span class="profile-latency-key">Read</span>
+                            <span class="profile-latency-number">{15}</span>
+                            {16}
+                        </div>
+                        <div class="profile-latency-stat{17}">
+                            <span class="profile-latency-key">Write</span>
+                            <span class="profile-latency-number">{18}</span>
+                            {19}
+                        </div>
+                    </div>
+                    <span class="profile-metric-note">Diagnostics coverage: {20}</span>
+                </div>
+        </div>
+        <p class="profile-analysis">{21}</p>
+</article>
+'@ -f $profileNameHtml, $profileStampHtml, $diagnosticAnchorHtml, $focusLabelHtml, $assessmentClass, $assessmentLabelHtml, $targetTextHtml, $profileDetailBadges, $readLabelHtml, $readPrimaryHtml, $readSecondaryHtml, $writeLabelHtml, $writePrimaryHtml, $writeSecondaryHtml, $readLatencyClassSuffix, $readP99NumberHtml, $readP99UnitHtml, $writeLatencyClassSuffix, $writeP99NumberHtml, $writeP99UnitHtml, $diagnosticsDetailHtml, $sqlFitBlurbHtml
+        }
+
+        $coverageRows = @(
+                foreach ($selection in @($profileDiagnosticsSelections | Sort-Object Profile)) {
+                        [pscustomobject]@{
+                                Profile = [string]$selection.Profile
+                                SelectedRunId = [string]$selection.Run.RunId
+                                Timestamp = Format-FioHtmlTimestamp -TimestampUtc $selection.Run.TimestampUtc
+                                Diagnostics = $selection.State.Label
+                                Detail = $selection.State.Detail
+                                AvailableRuns = $selection.AvailableRuns
+                                RequestedRuns = $selection.RequestedRuns
+                                TotalRuns = $selection.TotalRuns
+                        }
+                }
+        )
+        $coverageTableHtml = NewHtmlTableMarkup -Rows $coverageRows
+
+        $diagnosticsSectionsHtml = foreach ($selection in @($profileDiagnosticsSelections | Sort-Object Profile)) {
+                $selectedRun = $selection.Run
+                $selectedRunId = [string]$selectedRun.RunId
+            $selectedRunAssessment = Get-FioHtmlOverallAssessmentModel -Run $selectedRun
+            $selectedRunAnalysis = Get-FioHtmlSqlFitBlurb -Run $selectedRun
+            $summaryMessage = if ($selectedRun.Diagnostics) { [string]$selectedRun.Diagnostics.Message } else { 'Diagnostics were not captured for this profile selection.' }
+            $summaryStatusClass = switch ($selection.State.Status) {
+                'Available' { 'diag-good' }
+                'Partial' { 'diag-warn' }
+                'MissingLogs' { 'diag-bad' }
+                'Unreadable' { 'diag-bad' }
+                'MissingSummary' { 'diag-bad' }
+                'Unavailable' { 'diag-bad' }
+                default { 'diag-neutral' }
+            }
+                $selectedRunIdHtml = [System.Net.WebUtility]::HtmlEncode($selectedRunId)
+                $diagnosticsLabelHtml = [System.Net.WebUtility]::HtmlEncode($selection.State.Label)
+                $assessmentClass = [string]$selectedRunAssessment.Class
+                $assessmentLabelHtml = [System.Net.WebUtility]::HtmlEncode([string]$selectedRunAssessment.Label)
+                $summaryTimeHtml = [System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $selectedRun.TimestampUtc))
+                $summaryTargetTypeHtml = [System.Net.WebUtility]::HtmlEncode([string]$selectedRun.TargetType)
+                $summarySeriesCount = if ($selectedRun.Diagnostics) { @($selectedRun.Diagnostics.Series).Count } else { 0 }
+                $summaryDuration = if ($selectedRun.Diagnostics -and $null -ne $selectedRun.Diagnostics.TimeRangeMs) { '{0:N1}s' -f ($selectedRun.Diagnostics.TimeRangeMs / 1000.0) } else { '-' }
+                $summarySeriesCountHtml = [System.Net.WebUtility]::HtmlEncode([string]$summarySeriesCount)
+                $summaryDurationHtml = [System.Net.WebUtility]::HtmlEncode([string]$summaryDuration)
+                $summaryCoverageHtml = [System.Net.WebUtility]::HtmlEncode([string]$selection.State.Detail)
+                $summaryTargetPathHtml = [System.Net.WebUtility]::HtmlEncode([string]$selectedRun.TargetPath)
+                $summaryMessageHtml = [System.Net.WebUtility]::HtmlEncode($summaryMessage)
+                $summaryAnalysisHtml = [System.Net.WebUtility]::HtmlEncode($selectedRunAnalysis)
+                $summaryMetaHtml = @'
+    <div class="diagnostic-summary">
+        <div class="diagnostic-summary-head">
+            <div class="diagnostic-summary-run">
+                <div class="metric-label">Selected Run</div>
+                <div class="diagnostic-summary-runid">{0}</div>
+            </div>
+            <div class="diagnostic-summary-badges">
+                <span class="diag-pill {1}">{2}</span>
+                <span class="assessment-pill {3}">{4}</span>
+            </div>
+        </div>
+        <div class="diagnostic-summary-meta">
+            <span class="meta-chip"><span class="meta-chip-label">Time</span><span class="meta-chip-value">{5}</span></span>
+            <span class="meta-chip"><span class="meta-chip-label">Target</span><span class="meta-chip-value">{6}</span></span>
+            <span class="meta-chip"><span class="meta-chip-label">Series</span><span class="meta-chip-value">{7}</span></span>
+            <span class="meta-chip"><span class="meta-chip-label">Duration</span><span class="meta-chip-value">{8}</span></span>
+            <span class="meta-chip"><span class="meta-chip-label">Coverage</span><span class="meta-chip-value">{9}</span></span>
+        </div>
+        <div class="diagnostic-summary-target">{10}</div>
+        <div class="diagnostic-summary-copy">
+            <p class="diagnostic-summary-message">{11}</p>
+            <p class="diagnostic-summary-analysis">{12}</p>
+        </div>
+    </div>
+'@ -f $selectedRunIdHtml, $summaryStatusClass, $diagnosticsLabelHtml, $assessmentClass, $assessmentLabelHtml, $summaryTimeHtml, $summaryTargetTypeHtml, $summarySeriesCountHtml, $summaryDurationHtml, $summaryCoverageHtml, $summaryTargetPathHtml, $summaryMessageHtml, $summaryAnalysisHtml
+
+                $chartModels = @(Get-FioDiagnosticsChartModels -Diagnostics $selectedRun.Diagnostics)
+                $chartStacks = foreach ($chartModel in $chartModels) {
+                        $chartSeries = @(GetDiagnosticsSeriesByKey -Diagnostics $selectedRun.Diagnostics -Key $chartModel.Key)
+                        if ($chartSeries.Count -eq 0) {
+                                continue
+                        }
+                        $chartMarkup = New-FioHtmlLineChartSection -Title $chartModel.Title -Series $chartSeries -Subtitle ('{0} · {1}' -f $chartModel.Subtitle, $selectedRunId)
+                        $tableMarkup = NewCollapsibleTableMarkup -Title ('Show raw data for {0}' -f $chartModel.Title) -Rows @($chartModel.PointRows)
+                    @'
+        <div class="diagnostic-card-stack">
+            {0}
+            {1}
+        </div>
+'@ -f $chartMarkup, $tableMarkup
+                }
+
+                if ($chartStacks.Count -eq 0) {
+                        $chartStacks = @("<div class='empty-state'>No chartable diagnostics were captured for this selection.</div>")
+                }
+
+                $diagnosticSectionId = [System.Net.WebUtility]::HtmlEncode([string]$selection.Profile.ToLowerInvariant())
+                $diagnosticProfileTitleHtml = [System.Net.WebUtility]::HtmlEncode([string]$selection.Profile)
+                $chartStacksHtml = $chartStacks -join [Environment]::NewLine
+
+                @'
+        <section id="diagnostics-{0}" class="section-card">
+            <div class="section-heading">
+                <div>
+                    <h2>{1} Diagnostics</h2>
+                    <p>Latest diagnostics-ready run selected for this profile.</p>
+                </div>
+            </div>
+            {2}
+            <div class="diagnostic-grid">
+                {3}
+            </div>
+        </section>
+'@ -f $diagnosticSectionId, $diagnosticProfileTitleHtml, $summaryMetaHtml, $chartStacksHtml
+        }
+
+        $profileHistorySectionsHtml = foreach ($profileGroup in $profileGroups) {
+                $profileRows = @(
+                        foreach ($run in @($profileGroup.Group | Sort-Object TimestampUtc -Descending)) {
+                                $diagState = Get-FioDiagnosticsRenderState -Diagnostics $run.Diagnostics
+                                [pscustomobject]@{
+                                        Timestamp = Format-FioHtmlTimestamp -TimestampUtc $run.TimestampUtc
+                                        RunId = [string]$run.RunId
+                                        TargetType = [string]$run.TargetType
+                                        TargetPath = [string]$run.TargetPath
+                                        Diagnostics = $diagState.Label
+                                        ReadMBps = [math]::Round([double]$run.Read.BandwidthMBps, 2)
+                                        ReadIops = [math]::Round([double]$run.Read.Iops, 2)
+                                        WriteMBps = [math]::Round([double]$run.Write.BandwidthMBps, 2)
+                                        WriteIops = [math]::Round([double]$run.Write.Iops, 2)
+                                        ReadP99Ms = if ($null -ne $run.Read.P99LatencyUs) { [math]::Round(($run.Read.P99LatencyUs / 1000.0), 2) } else { $null }
+                                        WriteP99Ms = if ($null -ne $run.Write.P99LatencyUs) { [math]::Round(($run.Write.P99LatencyUs / 1000.0), 2) } else { $null }
+                                }
+                        }
+                )
+                $profileTableHtml = NewHtmlTableMarkup -Rows $profileRows
+                $profileGroupNameHtml = [System.Net.WebUtility]::HtmlEncode([string]$profileGroup.Name)
+                $profileRunCountHtml = [System.Net.WebUtility]::HtmlEncode(('{0} runs' -f $profileRows.Count))
+                @'
+        <section class="section-card">
+            <div class="section-heading">
+                <div>
+                    <h2>{0}</h2>
+                    <p>Run history for this profile.</p>
+                </div>
+                <div class="pill">{1}</div>
+            </div>
+            {2}
+        </section>
+'@ -f $profileGroupNameHtml, $profileRunCountHtml, $profileTableHtml
+        }
+
+        $rollupTableData = @(
+                foreach ($rollup in $rollupRows | Sort-Object Profile, TargetType, TargetPath) {
+                        [pscustomobject]@{
+                                Profile = [string]$rollup.Profile
+                                TargetType = [string]$rollup.TargetType
+                                TargetPath = [string]$rollup.TargetPath
+                                Runs = [string]$rollup.RunCount
+                                DiagnosticsRequested = [string]$rollup.DiagnosticsRequestedRuns
+                                DiagnosticsAvailable = [string]$rollup.DiagnosticsAvailableRuns
+                                ReadIopsAvg = if ($rollup.ReadIops) { [math]::Round([double]$rollup.ReadIops.Avg, 2) } else { $null }
+                                ReadMBpsAvg = if ($rollup.ReadBandwidthMBps) { [math]::Round([double]$rollup.ReadBandwidthMBps.Avg, 2) } else { $null }
+                                WriteIopsAvg = if ($rollup.WriteIops) { [math]::Round([double]$rollup.WriteIops.Avg, 2) } else { $null }
+                                WriteMBpsAvg = if ($rollup.WriteBandwidthMBps) { [math]::Round([double]$rollup.WriteBandwidthMBps.Avg, 2) } else { $null }
+                                LastTimestamp = Format-FioHtmlTimestamp -TimestampUtc $rollup.LastTimestampUtc
+                        }
+                }
+        )
+        $rollupTableHtml = NewHtmlTableMarkup -Rows $rollupTableData
+
+        $runTableData = @(
+                foreach ($run in $orderedRuns | Sort-Object TimestampUtc -Descending) {
+                        $diagState = Get-FioDiagnosticsRenderState -Diagnostics $run.Diagnostics
+                        [pscustomobject]@{
+                                Timestamp = Format-FioHtmlTimestamp -TimestampUtc $run.TimestampUtc
+                                RunId = [string]$run.RunId
+                                Profile = [string]$run.Profile
+                                TargetType = [string]$run.TargetType
+                                TargetPath = [string]$run.TargetPath
+                                Iterations = [string]$run.IterationCount
+                                Diagnostics = $diagState.Label
+                                ReadIops = [math]::Round([double]$run.Read.Iops, 2)
+                                ReadMBps = [math]::Round([double]$run.Read.BandwidthMBps, 2)
+                                WriteIops = [math]::Round([double]$run.Write.Iops, 2)
+                                WriteMBps = [math]::Round([double]$run.Write.BandwidthMBps, 2)
+                        }
+                }
+        )
+        $runTableHtml = NewHtmlTableMarkup -Rows $runTableData
+
+        $resultsRootText = if ([string]::IsNullOrWhiteSpace($ResultsRoot)) { '-' } else { $ResultsRoot }
+
+        $html = @"
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='utf-8' />
+    <meta name='viewport' content='width=device-width, initial-scale=1' />
+    <title>$([System.Net.WebUtility]::HtmlEncode($Title))</title>
+    <style>
+        :root {
+            --bg: #eef3f8;
+            --panel: rgba(255,255,255,0.94);
+            --panel-soft: rgba(248,251,254,0.96);
+            --ink: #162133;
+            --muted: #5f7085;
+            --line: rgba(148,163,184,0.22);
+            --accent: #0f766e;
+            --accent-2: #b45309;
+            --accent-3: #2563eb;
+            --shadow: rgba(15,23,42,0.10);
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            color: var(--ink);
+            font-family: Aptos, "Segoe UI Variable Text", "Segoe UI", sans-serif;
+            background:
+                radial-gradient(circle at top right, rgba(20,184,166,0.15), transparent 22%),
+                radial-gradient(circle at top left, rgba(245,158,11,0.10), transparent 18%),
+                linear-gradient(180deg, #f6f2ea 0%, var(--bg) 36%, #edf2f7 100%);
+        }
+        main {
+            max-width: 1480px;
+            margin: 0 auto;
+            padding: 26px 18px 48px;
+        }
+        h1, h2, h3, p { margin: 0; }
+        .hero, .section-card, .metric-card, .profile-card, .highlight-card, .chart-card, .collapsible-table {
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            background: var(--panel);
+            box-shadow: 0 18px 45px var(--shadow);
+            backdrop-filter: blur(12px);
+        }
+        .hero {
+            padding: 26px;
+            margin-bottom: 18px;
+        }
+        .hero-title {
+            font-size: 2.2rem;
+            line-height: 1.08;
+            letter-spacing: -0.04em;
+            margin-bottom: 10px;
+        }
+        .hero-subtitle {
+            color: var(--muted);
+            font-size: 0.92rem;
+            line-height: 1.45;
+            max-width: 72ch;
+        }
+        .hero-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px 18px;
+            margin-top: 12px;
+            color: var(--muted);
+            font-size: 0.8rem;
+        }
+        .metric-grid, .latest-grid, .highlight-grid, .diagnostic-grid {
+            display: grid;
+            gap: 16px;
+        }
+        .metric-grid {
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            margin-top: 18px;
+        }
+        .metric-card, .highlight-card {
+            padding: 18px;
+        }
+        .metric-label, .profile-metric-label {
+            display: block;
+            color: var(--muted);
+            font-size: 0.76rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+        .metric-value {
+            font-size: 1.46rem;
+            font-weight: 800;
+        }
+        .highlight-grid {
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            margin: 18px 0 22px;
+        }
+        .highlight-card {
+            background: linear-gradient(180deg, rgba(15,23,42,0.98), rgba(30,41,59,0.96));
+            color: #f8fafc;
+            min-height: 168px;
+            padding: 18px 20px;
+        }
+        .highlight-card .metric-label {
+            color: #93a4b8;
+            margin-bottom: 12px;
+        }
+        .highlight-stat-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 18px;
+            min-height: 100px;
+        }
+        .highlight-stat {
+            min-width: 0;
+        }
+        .highlight-stat-single {
+            display: grid;
+            align-content: end;
+            min-height: 100px;
+        }
+        .highlight-stat-label {
+            font-size: 0.72rem;
+            letter-spacing: 0.07em;
+            text-transform: uppercase;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+        .highlight-stat-context {
+            color: #dbe5f3;
+            font-size: 0.98rem;
+            font-weight: 750;
+            margin-bottom: 8px;
+            line-height: 1.1;
+        }
+        .highlight-card .tone-read {
+            color: #67e8f9;
+        }
+        .highlight-card .tone-write {
+            color: #fbbf24;
+        }
+        .tone-read {
+            color: #67e8f9;
+        }
+        .tone-write {
+            color: #fbbf24;
+        }
+        .highlight-metric {
+            font-size: 1.98rem;
+            font-weight: 800;
+            line-height: 0.98;
+            letter-spacing: -0.03em;
+            margin-bottom: 8px;
+        }
+        .highlight-secondary {
+            color: #d5deea;
+            font-size: 0.88rem;
+            line-height: 1.25;
+            margin-top: 10px;
+        }
+        .section-card {
+            padding: 18px;
+            margin-bottom: 18px;
+        }
+        .section-card.section-toggle {
+            padding: 0;
+            overflow: hidden;
+        }
+        .section-heading {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        .section-heading p {
+            color: var(--muted);
+            font-size: 0.86rem;
+            line-height: 1.38;
+            margin-top: 4px;
+        }
+        .section-heading h2 {
+            font-size: 1.06rem;
+            line-height: 1.2;
+        }
+        .pill {
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 6px 10px;
+            color: var(--muted);
+            font-size: 0.72rem;
+            white-space: nowrap;
+            background: rgba(255,255,255,0.7);
+        }
+        .section-toggle > summary {
+            list-style: none;
+            cursor: pointer;
+            padding: 18px;
+            background: linear-gradient(180deg, rgba(248,250,252,0.92), rgba(241,245,249,0.90));
+            border-bottom: 1px solid rgba(148,163,184,0.14);
+        }
+        .section-toggle > summary::-webkit-details-marker {
+            display: none;
+        }
+        .section-toggle-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            padding-right: 28px;
+            position: relative;
+        }
+        .section-toggle-head::after {
+            content: '+';
+            position: absolute;
+            right: 0;
+            top: 2px;
+            color: var(--accent);
+            font-size: 1.25rem;
+            font-weight: 800;
+            line-height: 1;
+        }
+        .section-toggle[open] .section-toggle-head::after {
+            content: '\2212';
+        }
+        .section-toggle > summary p {
+            color: var(--muted);
+            line-height: 1.45;
+            margin-top: 4px;
+        }
+        .section-toggle-body {
+            padding: 18px;
+            background: rgba(255,255,255,0.74);
+        }
+        .latest-grid {
+            grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+        }
+        .profile-card {
+            padding: 18px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(238,244,251,0.98));
+            box-shadow: 0 20px 48px rgba(15,23,42,0.08);
+            border-color: rgba(148,163,184,0.2);
+        }
+        .profile-card-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: flex-start;
+            margin-bottom: 12px;
+        }
+        .profile-card-badges {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            gap: 8px;
+        }
+        .profile-card h3 {
+            font-size: 1.08rem;
+            line-height: 1.15;
+        }
+        .profile-stamp {
+            margin-top: 5px;
+            color: var(--muted);
+            font-size: 0.8rem;
+        }
+        .profile-jump-link {
+            display: inline-flex;
+            align-items: center;
+            margin-top: 8px;
+            color: #2563eb;
+            font-size: 0.74rem;
+            font-weight: 700;
+            text-decoration: none;
+            line-height: 1.2;
+        }
+        .profile-jump-link:hover {
+            color: #1d4ed8;
+            text-decoration: underline;
+        }
+        .profile-target {
+            color: #334155;
+            font-size: 0.84rem;
+            line-height: 1.35;
+            margin-bottom: 10px;
+            word-break: break-word;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(148,163,184,0.14);
+        }
+        .profile-detail-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 7px;
+            margin: 0 0 12px;
+        }
+        .profile-metric-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .profile-metric {
+            border: 1px solid rgba(148,163,184,0.18);
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(255,255,255,1), rgba(240,245,251,0.98));
+            padding: 12px 14px;
+            min-height: 108px;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.72);
+        }
+        .profile-metric-primary {
+            background: linear-gradient(180deg, rgba(255,255,255,1), rgba(235,242,250,0.98));
+            border-color: rgba(96,165,250,0.2);
+        }
+        .profile-metric-latency {
+            background: linear-gradient(180deg, rgba(252,253,255,0.98), rgba(236,242,251,0.98));
+            border-color: rgba(148,163,184,0.24);
+        }
+        .profile-metric-value {
+            display: block;
+            font-weight: 800;
+            font-size: 1.28rem;
+            line-height: 1.12;
+            letter-spacing: -0.02em;
+        }
+        .profile-metric-note {
+            display: block;
+            margin-top: 8px;
+            color: var(--muted);
+            font-size: 0.76rem;
+            line-height: 1.25;
+        }
+        .profile-latency-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+            margin-top: 2px;
+        }
+        .profile-latency-stat {
+            min-width: 0;
+        }
+        .profile-latency-key {
+            display: block;
+            color: var(--muted);
+            font-size: 0.68rem;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        .profile-latency-number {
+            display: block;
+            font-size: clamp(0.84rem, 0.9vw, 0.98rem);
+            font-weight: 800;
+            line-height: 1.04;
+            letter-spacing: -0.03em;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+        .profile-latency-unit {
+            display: block;
+            margin-top: 2px;
+            color: var(--muted);
+            font-size: 0.62rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .profile-latency-stat-empty .profile-latency-number {
+            letter-spacing: 0;
+        }
+        .profile-detail-badges .setting-badge {
+            padding: 4px 8px;
+            font-size: 0.7rem;
+            background: rgba(255,255,255,0.88);
+        }
+        .profile-detail-badges .setting-key {
+            font-size: 0.62rem;
+        }
+        .profile-detail-badges .setting-value {
+            font-size: 0.72rem;
+        }
+        .profile-analysis,
+        .diagnostic-summary-analysis {
+            margin-top: 10px;
+            color: #475569;
+            font-size: 0.8rem;
+            line-height: 1.4;
+            max-width: 90ch;
+        }
+        .focus-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(37,99,235,0.14);
+            background: rgba(37,99,235,0.08);
+            color: #1d4ed8;
+            font-size: 0.72rem;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+        .assessment-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+        .assessment-excellent { background: rgba(16,185,129,0.16); color: #047857; }
+        .assessment-good { background: rgba(59,130,246,0.14); color: #1d4ed8; }
+        .assessment-poor { background: rgba(239,68,68,0.14); color: #b91c1c; }
+        .assessment-neutral { background: rgba(148,163,184,0.18); color: #475569; }
+        .diag-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+        .diag-good { background: rgba(16,185,129,0.16); color: #047857; }
+        .diag-warn { background: rgba(245,158,11,0.18); color: #b45309; }
+        .diag-bad { background: rgba(239,68,68,0.14); color: #b91c1c; }
+        .diag-neutral { background: rgba(148,163,184,0.18); color: #475569; }
+        .diagnostic-grid {
+            grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+            align-items: start;
+            margin-top: 16px;
+        }
+        .diagnostic-card-stack {
+            display: grid;
+            gap: 12px;
+            min-width: 0;
+        }
+        .chart-card {
+            padding: 14px;
+            background: var(--panel-soft);
+        }
+        .chart-card h2 {
+            font-size: 1.02rem;
+        }
+        .chart-card .section-heading p {
+            font-size: 0.81rem;
+            line-height: 1.34;
+        }
+        .diagnostic-summary {
+            border: 1px solid rgba(148,163,184,0.14);
+            border-radius: 20px;
+            padding: 16px 18px;
+            background: linear-gradient(180deg, rgba(248,250,252,0.84), rgba(255,255,255,0.9));
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+        }
+        .diagnostic-summary-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 14px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(148,163,184,0.14);
+        }
+        .diagnostic-summary-run {
+            min-width: 0;
+        }
+        .diagnostic-summary-runid {
+            font-size: 1rem;
+            font-weight: 800;
+            line-height: 1.15;
+            word-break: break-word;
+        }
+        .diagnostic-summary-badges {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            gap: 8px;
+        }
+        .diagnostic-summary-meta {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .meta-chip,
+        .setting-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 5px 9px;
+            border-radius: 999px;
+            border: 1px solid rgba(148,163,184,0.18);
+            background: rgba(255,255,255,0.78);
+            color: #334155;
+            font-size: 0.74rem;
+            line-height: 1.25;
+        }
+        .meta-chip-label {
+            color: var(--muted);
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            font-size: 0.64rem;
+        }
+        .meta-chip-value {
+            font-weight: 700;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+        .setting-key {
+            color: var(--muted);
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            font-size: 0.66rem;
+        }
+        .setting-value {
+            font-weight: 700;
+        }
+        .diagnostic-summary-target {
+            margin-top: 12px;
+            color: #0f172a;
+            font-size: 0.82rem;
+            font-family: Consolas, "Cascadia Mono", monospace;
+            line-height: 1.35;
+            word-break: break-word;
+        }
+        .diagnostic-summary-copy {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(148,163,184,0.12);
+        }
+        .diagnostic-summary-message {
+            margin-top: 0;
+            color: var(--muted);
+            font-size: 0.8rem;
+            line-height: 1.35;
+            max-width: 92ch;
+        }
+        .diagnostic-summary-copy .diagnostic-summary-analysis {
+            margin-top: 8px;
+        }
+        .empty-state {
+            padding: 18px;
+            border: 1px dashed rgba(148,163,184,0.36);
+            border-radius: 18px;
+            color: var(--muted);
+            background: rgba(255,255,255,0.76);
+        }
+        .table-shell {
+            overflow: auto;
+            border: 1px solid rgba(148,163,184,0.14);
+            border-radius: 18px;
+            background: rgba(255,255,255,0.78);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.56);
+        }
+        table.report-table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 920px;
+        }
+        table.report-table th,
+        table.report-table td {
+            padding: 11px 12px;
+            text-align: left;
+            border-bottom: 1px solid rgba(148,163,184,0.14);
+            vertical-align: top;
+        }
+        table.report-table th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background: rgba(248,250,252,0.98);
+            color: #334155;
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        table.report-table tbody tr:nth-child(even) {
+            background: rgba(248,250,252,0.55);
+        }
+        table.report-table tbody tr:hover {
+            background: rgba(20,184,166,0.08);
+        }
+        table.report-table-compact {
+            min-width: 760px;
+        }
+        .collapsible-table {
+            padding: 14px;
+            background: rgba(255,255,255,0.88);
+        }
+        .collapsible-table summary {
+            cursor: pointer;
+            font-weight: 700;
+            color: #1f2937;
+            font-size: 0.88rem;
+            list-style: none;
+        }
+        .collapsible-table summary::-webkit-details-marker {
+            display: none;
+        }
+        .collapsible-table summary::before {
+            content: '+';
+            display: inline-block;
+            width: 18px;
+            color: var(--accent);
+            font-weight: 800;
+        }
+        .collapsible-table[open] summary::before {
+            content: '\2212';
+        }
+        .collapsible-table .table-shell {
+            margin-top: 12px;
+        }
+        .diagnostic-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px 14px;
+            margin-bottom: 12px;
+        }
+        .diagnostic-legend-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 600;
+        }
+        .diagnostic-legend-swatch {
+            width: 12px;
+            height: 12px;
+            border-radius: 999px;
+            flex: 0 0 auto;
+        }
+        .diagnostic-chart-wrap {
+            display: grid;
+            grid-template-columns: 58px 1fr;
+            gap: 10px;
+            align-items: stretch;
+        }
+        .diagnostic-chart {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .diagnostic-axis {
+            display: flex;
+            color: var(--muted);
+            font-size: 0.72rem;
+            font-weight: 600;
+        }
+        .diagnostic-axis-y {
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 10px 0 30px;
+            text-align: right;
+        }
+        .diagnostic-axis-x {
+            justify-content: space-between;
+            padding-left: 68px;
+            margin-top: 6px;
+        }
+        .diagnostic-plot-bg {
+            fill: rgba(248,250,252,0.78);
+        }
+        .diagnostic-grid-line {
+            stroke: rgba(148,163,184,0.24);
+            stroke-width: 1;
+        }
+        .section-nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 0 0 18px;
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            padding: 10px 0 14px;
+            backdrop-filter: blur(10px);
+        }
+        .section-nav a {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 12px;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: rgba(255,255,255,0.75);
+            color: var(--ink);
+            text-decoration: none;
+            font-size: 0.72rem;
+            font-weight: 800;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        .section-nav a:hover {
+            background: rgba(20,184,166,0.10);
+            border-color: rgba(15,118,110,0.28);
+        }
+        @media (max-width: 960px) {
+            .diagnostic-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        @media (max-width: 720px) {
+            main {
+                padding: 18px 12px 34px;
+            }
+            .hero {
+                padding: 20px;
+            }
+            .hero-title {
+                font-size: 1.8rem;
+            }
+            .highlight-stat-grid {
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }
+            .profile-metric-grid,
+            .metric-grid,
+            .latest-grid,
+            .highlight-grid {
+                grid-template-columns: 1fr;
+            }
+            .profile-latency-grid {
+                grid-template-columns: 1fr;
+                gap: 8px;
+            }
+            .diagnostic-chart-wrap {
+                grid-template-columns: 1fr;
+            }
+            .diagnostic-axis-y {
+                display: none;
+            }
+            .diagnostic-axis-x {
+                padding-left: 0;
+            }
+            .diagnostic-summary-head {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .diagnostic-summary-meta {
+                grid-template-columns: 1fr;
+            }
+            .diagnostic-summary-badges,
+            .profile-card-badges {
+                justify-content: flex-start;
+            }
+            .section-toggle-head {
+                padding-right: 22px;
+            }
+            .section-toggle-head,
+            .section-heading {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <section class='hero'>
+            <h1 class='hero-title'>$([System.Net.WebUtility]::HtmlEncode($Title))</h1>
+            <p class='hero-subtitle'>Cross-profile benchmark scan built from the freshest run in each profile, with throughput, IOPS, latency, and diagnostics coverage prioritized for quick comparison.</p>
+            <div class='hero-meta'>
+                <span>Generated $([System.Net.WebUtility]::HtmlEncode((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))</span>
+                <span>Results root: $([System.Net.WebUtility]::HtmlEncode($resultsRootText))</span>
+            </div>
+            <div class='metric-grid'>
+                $($heroMetricsHtml -join [Environment]::NewLine)
+            </div>
+        </section>
+
+        <nav class='section-nav'>
+            <a href='#overview'>Overview</a>
+            <a href='#diagnostics'>Diagnostics</a>
+            <a href='#profiles'>Profiles</a>
+            <a href='#rollups'>Rollups</a>
+            <a href='#runs'>Runs</a>
+        </nav>
+
+        <section id='overview' class='section-card'>
+            <div class='section-heading'>
+                <div>
+                    <h2>Cross-Profile Highlights</h2>
+                    <p>The overview compares the freshest run from every profile present in history.</p>
+                </div>
+            </div>
+            <div class='highlight-grid'>
+                $($highlightHtml -join [Environment]::NewLine)
+            </div>
+            <div class='section-heading'>
+                <div>
+                    <h2>Latest By Profile</h2>
+                    <p>Each card represents the newest run captured for that profile.</p>
+                </div>
+            </div>
+            <div class='latest-grid'>
+                $($latestByProfileHtml -join [Environment]::NewLine)
+            </div>
+        </section>
+
+        <section id='diagnostics' class='section-card'>
+            <div class='section-heading'>
+                <div>
+                    <h2>Diagnostics Coverage By Profile</h2>
+                    <p>Each profile picks the newest diagnostics-ready run available. Raw data tables under each chart are collapsed by default.</p>
+                </div>
+            </div>
+            $coverageTableHtml
+        </section>
+
+        $($diagnosticsSectionsHtml -join [Environment]::NewLine)
+
+        $(NewCollapsibleSectionMarkup -Id 'profiles' -Title 'Profiles' -Description 'Full history for each benchmark profile.' -BadgeText ('{0} profiles' -f $profileGroups.Count) -InnerHtml ($profileHistorySectionsHtml -join [Environment]::NewLine))
+
+        $(NewCollapsibleSectionMarkup -Id 'rollups' -Title 'Historical Rollups' -Description 'Aggregated averages by profile and target path.' -BadgeText ('{0} rollups' -f $rollupRows.Count) -InnerHtml $rollupTableHtml)
+
+        $(NewCollapsibleSectionMarkup -Id 'runs' -Title 'Runs' -Description 'Complete run-level detail ordered newest first.' -BadgeText ('{0} runs' -f $orderedRuns.Count) -InnerHtml $runTableHtml)
+    </main>
+</body>
+</html>
+"@
+
+        $html | Set-Content -Path $Path -Encoding utf8
+}
+
 function Export-FioSqlBenchHtmlReport {
     [CmdletBinding()]
     param(
@@ -1927,563 +4686,8 @@ function Export-FioSqlBenchHtmlReport {
         [object[]]$Rollups
     )
 
-        function local:ConvertToHtmlSettingBadges {
-                param(
-                        [object[]]$Settings,
-                        [hashtable]$PreviousValues
-                )
-
-                $badges = New-Object System.Collections.Generic.List[string]
-                $normalBadges = New-Object System.Collections.Generic.List[string]
-                $changedBadges = New-Object System.Collections.Generic.List[string]
-
-                foreach ($setting in $Settings) {
-                        if ($null -eq $setting -or [string]::IsNullOrWhiteSpace([string]$setting.Value)) {
-                                continue
-                        }
-
-                        $label = if ($setting.PSObject.Properties['Label']) { [string]$setting.Label } else { [string]$setting.Key }
-                        $value = [string]$setting.Value
-                        $className = 'setting-badge'
-                        $title = '{0}={1}' -f $label, $value
-                        $isChanged = $false
-
-                        if ($null -ne $PreviousValues -and $PreviousValues.ContainsKey([string]$setting.Key)) {
-                                $previousValue = [string]$PreviousValues[[string]$setting.Key]
-                                if ($previousValue -ne $value) {
-                                        $className += ' setting-badge-changed'
-                                        $title = '{0} changed from {1} to {2}' -f $label, $previousValue, $value
-                                        $isChanged = $true
-                                }
-                        }
-
-                        $badgeHtml = @"
-<span class='$className' title='$([System.Net.WebUtility]::HtmlEncode($title))'>
-    <span class='setting-key'>$([System.Net.WebUtility]::HtmlEncode($label))</span>
-    <span class='setting-value'>$([System.Net.WebUtility]::HtmlEncode($value))</span>
-</span>
-"@
-
-                        if ($isChanged) {
-                                $changedBadges.Add($badgeHtml)
-                        }
-                        else {
-                                $normalBadges.Add($badgeHtml)
-                        }
-                }
-
-                foreach ($badge in $changedBadges) {
-                        $badges.Add($badge)
-                }
-                foreach ($badge in $normalBadges) {
-                        $badges.Add($badge)
-                }
-
-                if ($badges.Count -eq 0) {
-                        return "<span class='setting-badge setting-badge-empty'>No settings captured</span>"
-                }
-
-                return ($badges -join [Environment]::NewLine)
-        }
-
-        function local:GetSettingsChangeSummary {
-                param(
-                        [object[]]$Settings,
-                        [hashtable]$PreviousValues
-                )
-
-                if ($null -eq $PreviousValues) {
-                        return 'Baseline settings'
-                }
-
-                $changes = New-Object System.Collections.Generic.List[string]
-                foreach ($setting in $Settings) {
-                        if ($null -eq $setting -or [string]::IsNullOrWhiteSpace([string]$setting.Value)) {
-                                continue
-                        }
-
-                        $key = [string]$setting.Key
-                        if (-not $PreviousValues.ContainsKey($key)) {
-                                continue
-                        }
-
-                        $previousValue = [string]$PreviousValues[$key]
-                        $currentValue = [string]$setting.Value
-                        if ($previousValue -ne $currentValue) {
-                                $label = if ($setting.PSObject.Properties['Label']) { [string]$setting.Label } else { $key }
-                                $changes.Add(('{0}: {1} -> {2}' -f $label, $previousValue, $currentValue))
-                        }
-                }
-
-                if ($changes.Count -eq 0) {
-                        return 'Settings unchanged'
-                }
-
-                return ('Settings changed: ' + ($changes -join ', '))
-        }
-
-        function local:NewProfileComparisonSection {
-                param(
-                        [string]$Profile,
-                        [object[]]$ProfileRuns
-                )
-
-                $orderedProfileRuns = @($ProfileRuns | Sort-Object TimestampUtc)
-                $recentProfileRuns = @($orderedProfileRuns | Select-Object -Last 6)
-                $maxRead = @($recentProfileRuns | ForEach-Object { $_.Read.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
-                $maxWrite = @($recentProfileRuns | ForEach-Object { $_.Write.BandwidthMBps } | Where-Object { $null -ne $_ } | Measure-Object -Maximum).Maximum
-                if ($null -eq $maxRead -or $maxRead -le 0) { $maxRead = 1 }
-                if ($null -eq $maxWrite -or $maxWrite -le 0) { $maxWrite = 1 }
-
-                $rows = New-Object System.Collections.Generic.List[string]
-                for ($index = 0; $index -lt $recentProfileRuns.Count; $index++) {
-                        $run = $recentProfileRuns[$index]
-                        $previous = if ($index -gt 0) { $recentProfileRuns[$index - 1] } else { $null }
-                        $readP99Ms = if ($null -ne $run.Read.P99LatencyUs) { [math]::Round(($run.Read.P99LatencyUs / 1000.0), 2) } else { $null }
-                        $writeP99Ms = if ($null -ne $run.Write.P99LatencyUs) { [math]::Round(($run.Write.P99LatencyUs / 1000.0), 2) } else { $null }
-                        $previousReadP99Ms = if ($null -ne $previous -and $null -ne $previous.Read.P99LatencyUs) { [math]::Round(($previous.Read.P99LatencyUs / 1000.0), 2) } else { $null }
-                        $previousWriteP99Ms = if ($null -ne $previous -and $null -ne $previous.Write.P99LatencyUs) { [math]::Round(($previous.Write.P99LatencyUs / 1000.0), 2) } else { $null }
-                        $readDelta = Format-FioHtmlDelta -Current $run.Read.BandwidthMBps -Previous $(if ($null -ne $previous) { $previous.Read.BandwidthMBps } else { $null }) -Suffix ' MB/s'
-                        $writeDelta = Format-FioHtmlDelta -Current $run.Write.BandwidthMBps -Previous $(if ($null -ne $previous) { $previous.Write.BandwidthMBps } else { $null }) -Suffix ' MB/s'
-                        $readLatencyDelta = Format-FioHtmlDelta -Current $readP99Ms -Previous $previousReadP99Ms -Suffix ' ms' -LowerIsBetter
-                        $writeLatencyDelta = Format-FioHtmlDelta -Current $writeP99Ms -Previous $previousWriteP99Ms -Suffix ' ms' -LowerIsBetter
-                        $readWidth = [math]::Round((($run.Read.BandwidthMBps / $maxRead) * 100.0), 2)
-                        $writeWidth = [math]::Round((($run.Write.BandwidthMBps / $maxWrite) * 100.0), 2)
-
-                        $runSettings = @(
-                                [pscustomobject]@{ Key = 'BlockSize'; Label = 'bs'; Value = $run.BlockSize }
-                                [pscustomobject]@{ Key = 'QueueDepth'; Label = 'qd'; Value = if ($null -ne $run.QueueDepth) { [string]$run.QueueDepth } else { $null } }
-                                [pscustomobject]@{ Key = 'NumJobs'; Label = 'jobs'; Value = if ($null -ne $run.NumJobs) { [string]$run.NumJobs } else { $null } }
-                                [pscustomobject]@{ Key = 'FileSizeGB'; Label = 'size'; Value = if ($null -ne $run.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$run.FileSizeGB, 2)) } else { $null } }
-                                [pscustomobject]@{ Key = 'ReadWrite'; Label = 'rw'; Value = $run.ReadWrite }
-                                [pscustomobject]@{ Key = 'ReadMix'; Label = 'mix'; Value = if ($null -ne $run.ReadMix) { '{0}/{1}' -f $run.ReadMix, (100 - [int]$run.ReadMix) } else { $null } }
-                                [pscustomobject]@{ Key = 'Direct'; Label = 'direct'; Value = if ($null -ne $run.Direct) { [string]$run.Direct } else { $null } }
-                                [pscustomobject]@{ Key = 'Fsync'; Label = 'fsync'; Value = if ($null -ne $run.Fsync -and $run.Fsync -gt 0) { [string]$run.Fsync } else { $null } }
-                                [pscustomobject]@{ Key = 'RuntimeSec'; Label = 'runtime'; Value = if ($null -ne $run.RuntimeSec) { '{0}s' -f $run.RuntimeSec } else { $null } }
-                        )
-                        $targetSettings = @(
-                                [pscustomobject]@{ Key = 'IterationCount'; Label = 'iters'; Value = if ($null -ne $run.IterationCount) { [string]$run.IterationCount } else { $null } }
-                                [pscustomobject]@{ Key = 'FioVersion'; Label = 'fio'; Value = $run.FioVersion }
-                                [pscustomobject]@{ Key = 'TargetType'; Label = 'type'; Value = $run.TargetType }
-                            [pscustomobject]@{ Key = 'SmbServerName'; Label = 'server'; Value = if ($run.SmbMetadata) { $run.SmbMetadata.ServerName } else { $null } }
-                            [pscustomobject]@{ Key = 'SmbShareName'; Label = 'share'; Value = if ($run.SmbMetadata) { $run.SmbMetadata.ShareName } else { $null } }
-                            [pscustomobject]@{ Key = 'SmbDialect'; Label = 'dialect'; Value = if ($run.SmbMetadata) { $run.SmbMetadata.Dialect } else { $null } }
-                            [pscustomobject]@{ Key = 'SmbContinuouslyAvailable'; Label = 'ca'; Value = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.ContinuouslyAvailable) { [string]$run.SmbMetadata.ContinuouslyAvailable } else { $null } }
-                            [pscustomobject]@{ Key = 'SmbEncryptData'; Label = 'encrypt'; Value = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.EncryptData) { [string]$run.SmbMetadata.EncryptData } else { $null } }
-                            [pscustomobject]@{ Key = 'SmbMultichannelPathCount'; Label = 'channels'; Value = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.MultichannelPathCount) { [string]$run.SmbMetadata.MultichannelPathCount } else { $null } }
-                            [pscustomobject]@{ Key = 'SmbRdmaPathCount'; Label = 'rdma'; Value = if ($run.SmbMetadata -and $null -ne $run.SmbMetadata.RdmaPathCount) { [string]$run.SmbMetadata.RdmaPathCount } else { $null } }
-                        )
-
-                        $previousRunSettings = $null
-                        $previousTargetSettings = $null
-                        if ($null -ne $previous) {
-                                $previousRunSettings = @{
-                                        BlockSize = $previous.BlockSize
-                                        QueueDepth = if ($null -ne $previous.QueueDepth) { [string]$previous.QueueDepth } else { $null }
-                                        NumJobs = if ($null -ne $previous.NumJobs) { [string]$previous.NumJobs } else { $null }
-                                        FileSizeGB = if ($null -ne $previous.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$previous.FileSizeGB, 2)) } else { $null }
-                                        ReadWrite = $previous.ReadWrite
-                                        ReadMix = if ($null -ne $previous.ReadMix) { '{0}/{1}' -f $previous.ReadMix, (100 - [int]$previous.ReadMix) } else { $null }
-                                        Direct = if ($null -ne $previous.Direct) { [string]$previous.Direct } else { $null }
-                                        Fsync = if ($null -ne $previous.Fsync -and $previous.Fsync -gt 0) { [string]$previous.Fsync } else { $null }
-                                        RuntimeSec = if ($null -ne $previous.RuntimeSec) { '{0}s' -f $previous.RuntimeSec } else { $null }
-                                }
-                                $previousTargetSettings = @{
-                                        IterationCount = if ($null -ne $previous.IterationCount) { [string]$previous.IterationCount } else { $null }
-                                        FioVersion = $previous.FioVersion
-                                        TargetType = $previous.TargetType
-                                    SmbServerName = if ($previous.SmbMetadata) { $previous.SmbMetadata.ServerName } else { $null }
-                                    SmbShareName = if ($previous.SmbMetadata) { $previous.SmbMetadata.ShareName } else { $null }
-                                    SmbDialect = if ($previous.SmbMetadata) { $previous.SmbMetadata.Dialect } else { $null }
-                                    SmbContinuouslyAvailable = if ($previous.SmbMetadata -and $null -ne $previous.SmbMetadata.ContinuouslyAvailable) { [string]$previous.SmbMetadata.ContinuouslyAvailable } else { $null }
-                                    SmbEncryptData = if ($previous.SmbMetadata -and $null -ne $previous.SmbMetadata.EncryptData) { [string]$previous.SmbMetadata.EncryptData } else { $null }
-                                    SmbMultichannelPathCount = if ($previous.SmbMetadata -and $null -ne $previous.SmbMetadata.MultichannelPathCount) { [string]$previous.SmbMetadata.MultichannelPathCount } else { $null }
-                                    SmbRdmaPathCount = if ($previous.SmbMetadata -and $null -ne $previous.SmbMetadata.RdmaPathCount) { [string]$previous.SmbMetadata.RdmaPathCount } else { $null }
-                                }
-                        }
-
-                        $settingsBadgeHtml = ConvertToHtmlSettingBadges -Settings $runSettings -PreviousValues $previousRunSettings
-                        $targetBadgeHtml = ConvertToHtmlSettingBadges -Settings $targetSettings -PreviousValues $previousTargetSettings
-                        $runChangeSummary = GetSettingsChangeSummary -Settings $runSettings -PreviousValues $previousRunSettings
-                        $targetChangeSummary = GetSettingsChangeSummary -Settings $targetSettings -PreviousValues $previousTargetSettings
-
-                        $rows.Add(@"
-<tr>
-    <td>
-        <div class='run-date'>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $run.TimestampUtc)))</div>
-        <div class='subtle'>$([System.Net.WebUtility]::HtmlEncode([string]$run.RunId))</div>
-        <div class='settings-summary'>$([System.Net.WebUtility]::HtmlEncode($runChangeSummary))</div>
-        <div class='settings-badges'>
-            $settingsBadgeHtml
-        </div>
-    </td>
-    <td>
-        <div>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetType))</div>
-        <div class='subtle'>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetPath))</div>
-        <div class='settings-summary'>$([System.Net.WebUtility]::HtmlEncode($targetChangeSummary))</div>
-        <div class='settings-badges'>
-            $targetBadgeHtml
-        </div>
-    </td>
-    <td>
-        <div class='metric-cell'>
-            <span>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Read.BandwidthMBps -Suffix ' MB/s')))</span>
-            <div class='mini-track'><div class='mini-fill throughput-read' style='width: ${readWidth}%'></div></div>
-        </div>
-        <div class='delta $($readDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($readDelta.Text))</div>
-    </td>
-    <td>
-        <div class='metric-cell'>
-            <span>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Write.BandwidthMBps -Suffix ' MB/s')))</span>
-            <div class='mini-track'><div class='mini-fill throughput-write' style='width: ${writeWidth}%'></div></div>
-        </div>
-        <div class='delta $($writeDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($writeDelta.Text))</div>
-    </td>
-    <td>
-        <div>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $readP99Ms -Suffix ' ms')))</div>
-        <div class='delta $($readLatencyDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($readLatencyDelta.Text))</div>
-    </td>
-    <td>
-        <div>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $writeP99Ms -Suffix ' ms')))</div>
-        <div class='delta $($writeLatencyDelta.Class)'>$([System.Net.WebUtility]::HtmlEncode($writeLatencyDelta.Text))</div>
-    </td>
-</tr>
-"@)
-                }
-
-                return @"
-<section class='table-card profile-card'>
-    <div class='section-heading'>
-        <div>
-            <h2>$([System.Net.WebUtility]::HtmlEncode($Profile))</h2>
-            <p>Recent runs for this workload profile, with each row compared against the previous run in the same profile.</p>
-        </div>
-        <div class='pill'>$($recentProfileRuns.Count) runs shown</div>
-    </div>
-    <table>
-        <thead>
-            <tr>
-                <th>Run Time</th>
-                <th>Target</th>
-                <th>Read Throughput</th>
-                <th>Write Throughput</th>
-                <th>Read P99</th>
-                <th>Write P99</th>
-            </tr>
-        </thead>
-        <tbody>
-            $($rows -join [Environment]::NewLine)
-        </tbody>
-    </table>
-</section>
-"@
-        }
-
-    if ($Runs.Count -eq 0) {
-        throw 'Cannot build an HTML report without any runs.'
-    }
-
-    $orderedRuns = @($Runs | Sort-Object TimestampUtc)
-    $profileCount = @($orderedRuns.Profile | Sort-Object -Unique).Count
-    $smbRuns = @($orderedRuns | Where-Object { $_.TargetType -eq 'Smb' }).Count
-    $localRuns = @($orderedRuns | Where-Object { $_.TargetType -eq 'Local' }).Count
-    $rollupRows = if ($null -ne $Rollups) { @($Rollups) } else { @(Get-FioHistoricalRollup -Runs $orderedRuns) }
-    $profileSections = @(
-        foreach ($profileGroup in ($orderedRuns | Group-Object Profile | Sort-Object Name)) {
-            NewProfileComparisonSection -Profile $profileGroup.Name -ProfileRuns @($profileGroup.Group)
-        }
-    )
-
-    $runTableRows = New-Object System.Collections.Generic.List[string]
-    foreach ($run in ($orderedRuns | Sort-Object TimestampUtc -Descending)) {
-        $readMeanMs = if ($null -ne $run.Read.MeanLatencyUs) { [math]::Round(($run.Read.MeanLatencyUs / 1000.0), 2) } else { $null }
-        $writeMeanMs = if ($null -ne $run.Write.MeanLatencyUs) { [math]::Round(($run.Write.MeanLatencyUs / 1000.0), 2) } else { $null }
-        $runTableRows.Add(@"
-<tr>
-    <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $run.TimestampUtc)))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.Profile))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetType))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.TargetPath))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.IterationCount))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Read.BandwidthMBps -Suffix ' MB/s')))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $run.Write.BandwidthMBps -Suffix ' MB/s')))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $readMeanMs -Suffix ' ms')))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $writeMeanMs -Suffix ' ms')))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$run.ResultDirectory))</td>
-</tr>
-"@)
-    }
-
-    $rollupTableRows = New-Object System.Collections.Generic.List[string]
-    foreach ($rollup in ($rollupRows | Sort-Object Profile, TargetType, TargetPath)) {
-        $rollupTableRows.Add(@"
-<tr>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$rollup.Profile))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$rollup.TargetType))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$rollup.TargetPath))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode([string]$rollup.RunCount))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $rollup.ReadBandwidthMBps.Avg -Suffix ' MB/s')))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $rollup.WriteBandwidthMBps.Avg -Suffix ' MB/s')))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $rollup.ReadMeanLatencyMs.Avg -Suffix ' ms')))</td>
-  <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlMetric -Value $rollup.WriteMeanLatencyMs.Avg -Suffix ' ms')))</td>
-    <td>$([System.Net.WebUtility]::HtmlEncode((Format-FioHtmlTimestamp -TimestampUtc $rollup.LastTimestampUtc)))</td>
-</tr>
-"@)
-    }
-
-    $html = @"
-<!DOCTYPE html>
-<html lang='en'>
-<head>
-  <meta charset='utf-8' />
-  <meta name='viewport' content='width=device-width, initial-scale=1' />
-  <title>$([System.Net.WebUtility]::HtmlEncode($Title))</title>
-  <style>
-    :root {
-      --bg: #f4f1e8;
-      --panel: #fffdf8;
-      --ink: #1e2a2f;
-      --muted: #65737a;
-      --line: #d9d0bd;
-      --accent: #0f766e;
-      --accent-2: #b45309;
-      --accent-3: #1d4ed8;
-      --shadow: rgba(30, 42, 47, 0.08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: 'Segoe UI', Tahoma, sans-serif;
-      color: var(--ink);
-      background: linear-gradient(180deg, #efe7d6 0%, var(--bg) 220px);
-    }
-    main { max-width: 1400px; margin: 0 auto; padding: 32px 24px 48px; }
-    h1, h2 { margin: 0 0 12px; }
-    p { margin: 0; color: var(--muted); }
-    .hero, .card, .chart-card, .table-card {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      box-shadow: 0 12px 32px var(--shadow);
-    }
-    .hero { padding: 24px; margin-bottom: 20px; }
-        .hero-grid, .metric-grid, .chart-grid { display: grid; gap: 16px; }
-    .hero-grid { grid-template-columns: 2fr 1fr; align-items: end; }
-    .metric-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top: 20px; }
-    .chart-grid { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); margin: 20px 0; }
-    .card { padding: 18px; }
-    .metric-label { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
-    .metric-value { font-size: 28px; font-weight: 700; margin-top: 6px; }
-    .meta { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; margin-top: 14px; color: var(--muted); }
-    .chart-card, .table-card { padding: 18px; }
-        .profile-grid { display: grid; gap: 18px; margin: 20px 0; }
-        .profile-card { overflow-x: auto; }
-        .section-heading {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            gap: 12px;
-            margin-bottom: 8px;
-        }
-        .pill {
-            border: 1px solid var(--line);
-            border-radius: 999px;
-            padding: 6px 10px;
-            font-size: 12px;
-            color: var(--muted);
-            white-space: nowrap;
-        }
-    .bar-row {
-      display: grid;
-      grid-template-columns: minmax(140px, 1.2fr) 3fr minmax(90px, 0.8fr);
-      gap: 12px;
-      align-items: center;
-      margin-top: 12px;
-    }
-    .bar-label, .bar-value { font-size: 13px; }
-    .bar-track {
-      height: 14px;
-      background: #ece6d8;
-      border-radius: 999px;
-      overflow: hidden;
-    }
-    .bar-fill {
-      height: 100%;
-      border-radius: 999px;
-      background: var(--accent);
-    }
-        .mini-track {
-            height: 8px;
-            background: #ece6d8;
-            border-radius: 999px;
-            overflow: hidden;
-            min-width: 84px;
-        }
-        .mini-fill {
-            height: 100%;
-            border-radius: 999px;
-        }
-        .metric-cell {
-            display: grid;
-            grid-template-columns: auto 1fr;
-            gap: 10px;
-            align-items: center;
-        }
-        .delta {
-            margin-top: 4px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        .delta-good { color: #0f766e; }
-        .delta-bad { color: #b42318; }
-        .delta-neutral { color: var(--muted); }
-        .run-date { font-weight: 600; }
-        .subtle {
-            font-size: 12px;
-            color: var(--muted);
-            margin-top: 3px;
-            word-break: break-word;
-        }
-        .settings-badges {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            margin-top: 8px;
-        }
-        .settings-summary {
-            margin-top: 8px;
-            font-size: 11px;
-            color: #7c5e10;
-            background: #fff7e6;
-            border: 1px solid #f1d39b;
-            border-radius: 10px;
-            padding: 6px 8px;
-            line-height: 1.35;
-        }
-        .setting-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            border: 1px solid var(--line);
-            border-radius: 999px;
-            padding: 3px 8px;
-            font-size: 11px;
-            line-height: 1.3;
-            color: var(--muted);
-            background: #faf6ed;
-        }
-        .setting-badge-changed {
-            border-color: #d97706;
-            background: #fff3dc;
-            color: #9a3412;
-        }
-        .setting-badge-empty {
-            background: #f5f5f4;
-        }
-        .setting-key {
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            font-weight: 700;
-            font-size: 10px;
-        }
-        .setting-value {
-            font-weight: 600;
-        }
-    .throughput-read { background: linear-gradient(90deg, #0f766e, #14b8a6); }
-    .throughput-write { background: linear-gradient(90deg, #b45309, #f59e0b); }
-    .latency-read { background: linear-gradient(90deg, #1d4ed8, #60a5fa); }
-    .latency-write { background: linear-gradient(90deg, #7c3aed, #c084fc); }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 12px;
-      font-size: 13px;
-    }
-    th, td {
-      text-align: left;
-      padding: 10px 8px;
-      border-bottom: 1px solid var(--line);
-      vertical-align: top;
-    }
-    th { color: var(--muted); font-weight: 600; }
-    @media (max-width: 900px) {
-      .hero-grid { grid-template-columns: 1fr; }
-      .bar-row { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <section class='hero'>
-      <div class='hero-grid'>
-        <div>
-          <h1>$([System.Net.WebUtility]::HtmlEncode($Title))</h1>
-                    <p>Self-contained HTML report for fio SQL-style benchmarks, with recent comparisons grouped by workload profile and deltas against the previous run in each group.</p>
-          <div class='meta'>
-            <span>Generated: $([System.Net.WebUtility]::HtmlEncode(([DateTime]::UtcNow.ToString('u'))))</span>
-            <span>Results root: $([System.Net.WebUtility]::HtmlEncode([string]$ResultsRoot))</span>
-          </div>
-        </div>
-        <div class='metric-grid'>
-          <div class='card'><div class='metric-label'>Runs</div><div class='metric-value'>$($orderedRuns.Count)</div></div>
-          <div class='card'><div class='metric-label'>Profiles</div><div class='metric-value'>$profileCount</div></div>
-          <div class='card'><div class='metric-label'>SMB Runs</div><div class='metric-value'>$smbRuns</div></div>
-          <div class='card'><div class='metric-label'>Local Runs</div><div class='metric-value'>$localRuns</div></div>
-        </div>
-      </div>
-    </section>
-        <div class='profile-grid'>
-            $($profileSections -join [Environment]::NewLine)
-        </div>
-    <section class='table-card'>
-      <h2>Historical Rollups</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Profile</th>
-            <th>Target Type</th>
-            <th>Target Path</th>
-            <th>Runs</th>
-            <th>Read MB/s Avg</th>
-            <th>Write MB/s Avg</th>
-            <th>Read Mean ms Avg</th>
-            <th>Write Mean ms Avg</th>
-            <th>Last Run</th>
-          </tr>
-        </thead>
-        <tbody>
-          $($rollupTableRows -join [Environment]::NewLine)
-        </tbody>
-      </table>
-    </section>
-    <section class='table-card' style='margin-top: 20px;'>
-      <h2>Runs</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Timestamp</th>
-            <th>Profile</th>
-            <th>Target Type</th>
-            <th>Target Path</th>
-            <th>Iters</th>
-            <th>Read MB/s</th>
-            <th>Write MB/s</th>
-            <th>Read Mean ms</th>
-            <th>Write Mean ms</th>
-            <th>Result Directory</th>
-          </tr>
-        </thead>
-        <tbody>
-          $($runTableRows -join [Environment]::NewLine)
-        </tbody>
-      </table>
-    </section>
-  </main>
-</body>
-</html>
-"@
-
-    $html | Set-Content -Path $Path -Encoding utf8
+    Export-FioSqlBenchHtmlReportStatic -Runs $Runs -Path $Path -Title $Title -ResultsRoot $ResultsRoot -Rollups $Rollups
+    return
 }
 
-Export-ModuleMember -Function Resolve-FioSqlBenchTarget, Get-FioSqlBenchProfileDefaults, Merge-FioSqlBenchSettings, New-FioSqlBenchRunContext, New-FioSqlBenchJobContent, Get-FioBenchFilePaths, Test-FioPreparedFiles, Resolve-FioBinary, Invoke-FioSqlBenchRun, ConvertFrom-FioJsonToSummary, Export-FioSqlBenchCsv, Import-FioSqlBenchHistory, Get-FioHistoricalRollup, Export-FioSqlBenchHistoricalCsv, Export-FioSqlBenchHtmlReport, New-FioHtmlProfileComparisonSection, ConvertTo-FioHtmlSettingBadges
+Export-ModuleMember -Function Resolve-FioSqlBenchTarget, Get-FioSqlBenchProfileDefaults, Merge-FioSqlBenchSettings, New-FioSqlBenchRunContext, New-FioSqlBenchJobContent, Get-FioBenchFilePaths, Test-FioPreparedFiles, Resolve-FioBinary, Invoke-FioSqlBenchRun, ConvertFrom-FioJsonToSummary, Export-FioSqlBenchCsv, Export-FioSqlBenchDiagnosticsCsv, Import-FioSqlBenchHistory, Get-FioHistoricalRollup, Export-FioSqlBenchHistoricalCsv, Export-FioSqlBenchHtmlReport, New-FioHtmlProfileComparisonSection, ConvertTo-FioHtmlSettingBadges

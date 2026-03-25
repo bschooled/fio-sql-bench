@@ -1,6 +1,6 @@
 # fio-sql-bench
 
-`fio-sql-bench` is a Windows-first PowerShell harness for running file-based `fio` benchmarks that approximate common SQL Server storage patterns on either local disks or SMB shares.
+`fio-sql-bench` is a Windows-first PowerShell harness for running file-based `fio` benchmarks that approximate common SQL Server storage patterns on either local disks or SMB shares. It produces SQL-oriented console interpretation, per-run JSON/CSV/HTML artifacts, and a historical HTML dashboard for comparing profile baselines over time.
 
 ## Scope
 
@@ -9,9 +9,17 @@ Version 1 stays intentionally narrow:
 - File-based tests only
 - Missing target directories are created automatically
 - Local paths, UNC paths, and mapped SMB drives supported
-- Five built-in workload profiles: `Data`, `Log`, `Tempdb`, `BackupRestore`, `DbccScan`
+- Eight built-in workload profiles: `Data`, `Log`, `Tempdb`, `BackupRestore`, `DbccScan`, `MaxThroughput`, `MaxIOPs`, `All`
 - Structured JSON, CSV, and HTML output per run
 - Historical rollup reporting across multiple result folders
+
+## Current Highlights
+
+- Native self-contained HTML reports for both per-run and historical views; no external module is required to render the dashboards.
+- SQL-aware latency interpretation in the console and HTML, including `P99.9`, worst-worker `P99`, and stability (`CV`) indicators.
+- Optional `-EnableLogs` telemetry that captures windowed fio throughput, IOPS, and completion-latency logs and surfaces them as diagnostics charts.
+- An `All` profile that runs the built-in workload set in an efficiency-oriented order and emits one parent historical report for the batch.
+- Historical dashboards that keep profiles separated, compare each run against the previous run in the same profile, and surface diagnostics readiness explicitly.
 
 Raw device benchmarking is intentionally blocked to reduce destructive risk.
 
@@ -30,60 +38,21 @@ The script looks for `fio.exe` in:
 
 ## Workload Profiles
 
-### Data
+| Profile | Purpose | Default Working Set | Key fio Defaults | Notes |
+| --- | --- | --- | --- | --- |
+| `Data` | Approximates OLTP data file traffic. | `32 GB` | `rw=randrw`, `bs=8k`, `rwmixread=70`, `iodepth=32`, `numjobs=4` | Sized to push past common filesystem and memory-cache effects. |
+| `Log` | Approximates log writer behavior. | `8 GB` | `rw=write`, `bs=64k`, `iodepth=1`, `numjobs=1`, `fsync=1` | Direct I/O is enabled by default so client-side buffering is less likely to hide commit latency. |
+| `Tempdb` | Approximates scratch-heavy tempdb activity. | `16 GB` | `rw=randrw`, `bs=8k`, `rwmixread=50`, `iodepth=32`, `numjobs=8` | Tuned to reduce the chance that results are dominated by cache residency. |
+| `BackupRestore` | Approximates large-block backup or restore transfer behavior. | `64 GB` | `rw=rw`, `bs=1m`, `rwmixread=50`, `iodepth=8`, `numjobs=2` | Uses a larger transfer size so sequential throughput is measured with a realistic working set. |
+| `DbccScan` | Approximates DBCC-style large-block scan reads. | `32 GB` | `rw=read`, `bs=256k`, `iodepth=8`, `numjobs=2` | Focused on large-block read scan behavior. |
+| `MaxThroughput` | Targets best-case path saturation for raw sequential transfer testing on local storage or SMB shares. | `64 GB` | `rw=rw`, `bs=1m`, `rwmixread=50`, `iodepth=32`, `numjobs=4` | Intentionally less SQL-like and tuned for peak sustained throughput. |
+| `MaxIOPs` | Targets best-case small-block random I/O saturation for peak read and write IOPS testing. | `32 GB` | `bs=4k`, `iodepth=64`, `numjobs=8` | Runs two isolated phases against the same prepared files: `randread`, then `randwrite`. |
 
-Approximates OLTP data file traffic.
-Default working set: `32 GB` to push past common filesystem and memory-cache effects.
+Batch profile behavior:
 
-- `rw=randrw`
-- `bs=8k`
-- `rwmixread=70`
-- `iodepth=32`
-- `numjobs=4`
-
-### Log
-
-Approximates log writer behavior.
-Default working set: `8 GB`.
-
-- `rw=write`
-- `bs=64k`
-- `iodepth=1`
-- `numjobs=1`
-- `fsync=1`
-- direct I/O is enabled by default so client-side buffering is less likely to hide commit latency
-
-### Tempdb
-
-Approximates scratch-heavy tempdb activity.
-Default working set: `16 GB` to reduce the chance that results are dominated by cache residency.
-
-- `rw=randrw`
-- `bs=8k`
-- `rwmixread=50`
-- `iodepth=32`
-- `numjobs=8`
-
-### BackupRestore
-
-Approximates large-block backup or restore transfer behavior.
-Default working set: `64 GB` so sequential throughput is measured with a realistic transfer size.
-
-- `rw=rw`
-- `bs=1m`
-- `rwmixread=50`
-- `iodepth=8`
-- `numjobs=2`
-
-### DbccScan
-
-Approximates DBCC-style large-block scan reads.
-Default working set: `32 GB`.
-
-- `rw=read`
-- `bs=256k`
-- `iodepth=8`
-- `numjobs=2`
+| Profile | Execution Model | Output |
+| --- | --- | --- |
+| `All` | Runs `MaxThroughput`, `Data`, `DbccScan`, `BackupRestore`, `MaxIOPs`, `Tempdb`, and `Log` in a reuse-friendly order so compatible prepared files can be shared across child runs. | Writes child run folders plus `historical-summary.json`, `historical-summary.csv`, and `historical-report.html` under one parent result folder. |
 
 ## Usage
 
@@ -125,6 +94,7 @@ Benchmark file preparation is now less expensive than the original implementatio
 - The prep phase now uses larger sequential writes than the measured workload so SMB and other remote targets do not spend excessive time creating files with 8K synchronous I/O.
 - Pure write workloads such as the built-in `Log` profile skip the prep phase entirely because no pre-existing read surface is required.
 - If you are repeatedly testing the same target with the same settings, `-ReusePreparedFiles` keeps a validated prep cache under the target path and reuses it on later runs. This is especially helpful for slower SMB targets.
+- The `All` profile automatically groups compatible workloads so `MaxThroughput` can seed `Data` and `DbccScan`, while `MaxIOPs` can seed `Tempdb`, reducing redundant prep I/O inside the same batch run.
 
 The built-in `Data` and `Tempdb` profiles now default to larger working sets (`32 GB` and `16 GB`) so short benches are less likely to be dominated by RAM or filesystem cache effects.
 
@@ -145,6 +115,15 @@ Run against a mapped SMB drive and let the script auto-detect it as SMB:
 .\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath 'Z:\SqlBench' `
   -Profile Data
+```
+
+Enable chartable fio diagnostics for throughput, IOPS, and latency time series:
+
+```powershell
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath 'D:\SqlBench' `
+  -Profile MaxThroughput `
+  -EnableLogs
 ```
 
 Reuse previously prepared files for repeated runs against the same target and settings:
@@ -179,6 +158,21 @@ Dry-run the newer large-block profiles:
 .\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath 'D:\SqlBench' `
   -Profile DbccScan `
+  -DryRun
+
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath 'D:\SqlBench' `
+  -Profile MaxThroughput `
+  -DryRun
+
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath 'D:\SqlBench' `
+  -Profile MaxIOPs `
+  -DryRun
+
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath 'D:\SqlBench' `
+  -Profile All `
   -DryRun
 ```
 
@@ -238,21 +232,56 @@ The script uses Microsoft guidance as its interpretation baseline:
 - `iter-01-summary.json`: normalized summary for that iteration
 - `summary.json`: aggregate wrapper containing all iterations
 - `summary.csv`: flat iteration table for spreadsheets and diffing
-- `summary.html`: self-contained operator report with inline bar charts for throughput and latency
+- `summary.html`: self-contained operator report from the built-in static renderer with inline comparison charts and, when `-EnableLogs` is used, time-series diagnostics for throughput, IOPS, and completion latency
 - `iter-01-console.log`: non-JSON `fio` console output and errors
+
+When `-EnableLogs` is enabled, the run also emits windowed fio diagnostics artifacts:
+
+- `iter-01-diagnostics.csv`: flattened time-series export aggregated from fio per-job logs for charting outside the built-in HTML report
+- `iter-01-fio_bw.*.log`: raw fio bandwidth logs for that iteration
+- `iter-01-fio_iops.*.log`: raw fio IOPS logs for that iteration
+- `iter-01-fio_clat.*.log`: raw fio completion-latency logs for that iteration
+
+The diagnostics mode uses a `1000 ms` fio logging window so results remain chartable and small enough to keep with the run. Latency logs capture both average and max completion latency per window so short stalls and throttling events are easier to spot.
+
+The per-run HTML now reports whether diagnostics were `Disabled`, fully `Available`, `Partial`, or missing because fio never produced readable log files. That makes it easier to separate workload behavior from telemetry collection failures.
+
+The per-run `summary.html` report is generated by the built-in static renderer and is intended to read like an operator report rather than a raw benchmark dump:
+
+- SQL-oriented result cards summarize read and write health at a glance.
+- Assessment labels carry through the HTML using the same SQL guidance used in the console.
+- When diagnostics are enabled, throughput, IOPS, and completion-latency time-series charts are rendered directly into the report.
+- Diagnostics collection status is shown explicitly so missing telemetry is distinguishable from a clean run with diagnostics disabled.
+
+## Example Output
+
+Console output example for the `Data` profile:
+
+![Example SQL-oriented console output for the Data profile](imgs/data-example.png)
+
+Historical aggregate report example generated by `Export-FioSqlBenchReport.ps1`:
+
+![Example historical aggregate report](imgs/report-example.png)
 
 The historical export script writes these additional artifacts under the chosen results root:
 
 - `historical-summary.json`: aggregated run-level data model across result folders
 - `historical-summary.csv`: flat run-level table for spreadsheets and diffing
-- `historical-report.html`: self-contained historical dashboard with rollup tables and inline charts
+- `historical-report.html`: self-contained historical dashboard with rollup tables, profile cards, diagnostics summaries, and inline charts
+
+The historical exports also retain diagnostics state so runs that requested telemetry but failed to produce chartable logs are visible in the rollups instead of being silently treated the same as runs where diagnostics were never enabled.
 
 The CSV exports now retain additional SQL-relevant tail and stability fields, including `P99.9`, worst-worker `P99`, and bandwidth variation, so external analysis can distinguish average health from deep-tail or burst-driven problems.
 
 The historical HTML report is intended to be comparative rather than just archival:
 
-- Recent runs are grouped by workload profile so `Data`, `Log`, `Tempdb`, `BackupRestore`, and `DbccScan` do not blur together.
-- Each row is compared against the previous run in the same profile, with deltas shown for read/write throughput and read/write `P99` latency.
+- The overview is driven from the newest run in each profile so no single profile crowds out the rest of the estate.
+- Cross-profile highlight cards call out leaders for read/write IOPS, read/write throughput, and the lowest mean latency result.
+- Latest-profile cards surface the newest run for each workload with profile focus labels, SQL-fit assessment, and short interpretation blurbs.
+- Diagnostics coverage is retained at the profile level, including `Available`, `Partial`, and failure states for requested telemetry.
+- Each profile card links directly to the matching diagnostics section so you can jump from the overview to the detailed charts quickly.
+- Recent runs are grouped by workload profile so `Data`, `Log`, `Tempdb`, `BackupRestore`, `DbccScan`, `MaxThroughput`, and `MaxIOPs` do not blur together.
+- Each row is compared against the previous run in the same profile, with deltas shown for read/write throughput, read/write IOPS, and read/write `P99` latency.
 - Effective run settings are rendered as compact badges so changes in block size, queue depth, job count, direct I/O mode, runtime, and related knobs are visible at a glance.
 - When a setting changed relative to the previous run, the badge is highlighted and a short `Settings changed:` summary is printed under that row.
 
