@@ -1657,6 +1657,12 @@ function Write-FioSettingsBlock {
     if ($null -ne $Settings.IopsCap) {
         Write-FioProperty -Name 'IOPS cap' -Value ('{0:N0}' -f [int]$Settings.IopsCap)
     }
+    if ($Settings.PSObject.Properties['EffectiveLimiterBadge'] -and -not [string]::IsNullOrWhiteSpace([string]$Settings.EffectiveLimiterBadge)) {
+        Write-FioProperty -Name 'Limiter used' -Value ([string]$Settings.EffectiveLimiterBadge)
+    }
+    if ($Settings.PSObject.Properties['LimiterSelectionReason'] -and -not [string]::IsNullOrWhiteSpace([string]$Settings.LimiterSelectionReason)) {
+        Write-FioProperty -Name 'Limiter basis' -Value ([string]$Settings.LimiterSelectionReason)
+    }
 }
 
 function Write-FioIterationSummary {

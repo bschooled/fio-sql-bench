@@ -477,6 +477,42 @@ function Merge-FioSqlBenchSettings {
 
     $settings.BlockSizeBytes = $blockSizeBytes
     $settings.FileSizePerJobBytes = Get-FioAlignedByteCount -ByteCount $perJobBytes -Alignment $blockSizeBytes
+    $settings.RequestedThroughputCapMBps = $settings.ThroughputCapMBps
+    $settings.RequestedIopsCap = $settings.IopsCap
+
+    if ($null -ne $settings.ThroughputCapMBps -and $null -ne $settings.IopsCap) {
+        $settings.EffectiveLimiterMode = if ($settings.BlockSizeBytes -ge 256KB) { 'throughput' } else { 'iops' }
+        $settings.LimiterSelectionReason = if ($settings.BlockSizeBytes -ge 256KB) { 'Large-block profile' } else { 'Small-block profile' }
+    }
+    elseif ($null -ne $settings.ThroughputCapMBps) {
+        $settings.EffectiveLimiterMode = 'throughput'
+        $settings.LimiterSelectionReason = 'Throughput cap only'
+    }
+    elseif ($null -ne $settings.IopsCap) {
+        $settings.EffectiveLimiterMode = 'iops'
+        $settings.LimiterSelectionReason = 'IOPS cap only'
+    }
+    else {
+        $settings.EffectiveLimiterMode = $null
+        $settings.LimiterSelectionReason = $null
+    }
+
+    if ($settings.EffectiveLimiterMode -eq 'throughput') {
+        $settings.EffectiveThroughputCapMBps = $settings.ThroughputCapMBps
+        $settings.EffectiveIopsCap = $null
+        $settings.EffectiveLimiterBadge = if ($null -ne $settings.ThroughputCapMBps) { '{0:N0} MB/s cap' -f [decimal]$settings.ThroughputCapMBps } else { $null }
+    }
+    elseif ($settings.EffectiveLimiterMode -eq 'iops') {
+        $settings.EffectiveThroughputCapMBps = $null
+        $settings.EffectiveIopsCap = $settings.IopsCap
+        $settings.EffectiveLimiterBadge = if ($null -ne $settings.IopsCap) { '{0:N0} IOPS cap' -f [int]$settings.IopsCap } else { $null }
+    }
+    else {
+        $settings.EffectiveThroughputCapMBps = $null
+        $settings.EffectiveIopsCap = $null
+        $settings.EffectiveLimiterBadge = $null
+    }
+
     $settings.CpuAffinity = Get-FioCpuAffinityPlan -Settings ([pscustomobject]$settings)
     [pscustomobject]$settings
 }
@@ -552,37 +588,6 @@ function ConvertTo-FioRateLiteral {
     }
 
     return ('{0},{1}' -f [int64][math]::Max(1, [math]::Round($ReadValue, 0)), [int64][math]::Max(1, [math]::Round($WriteValue, 0)))
-}
-
-function Get-FioEffectiveRateCapMode {
-    [CmdletBinding()]
-    param(
-        [AllowNull()][double]$PerJobThroughputCapBytesPerSec,
-
-        [AllowNull()][double]$PerJobIopsCap,
-
-        [Parameter(Mandatory)]
-        [int64]$BlockSizeBytes
-    )
-
-    if (($null -eq $PerJobThroughputCapBytesPerSec -or $PerJobThroughputCapBytesPerSec -le 0) -and ($null -eq $PerJobIopsCap -or $PerJobIopsCap -le 0)) {
-        return $null
-    }
-
-    if ($null -eq $PerJobIopsCap -or $PerJobIopsCap -le 0) {
-        return 'throughput'
-    }
-
-    if ($null -eq $PerJobThroughputCapBytesPerSec -or $PerJobThroughputCapBytesPerSec -le 0) {
-        return 'iops'
-    }
-
-    $iopsEquivalentBytesPerSec = [double]$PerJobIopsCap * [double]$BlockSizeBytes
-    if ($PerJobThroughputCapBytesPerSec -le $iopsEquivalentBytesPerSec) {
-        return 'throughput'
-    }
-
-    return 'iops'
 }
 
 function Get-FioCpuTopology {
@@ -825,9 +830,9 @@ function New-FioSqlBenchJobContent {
 
     $prepBlockSizeBytes = Get-FioPreparationBlockSizeBytes -Settings $Settings
     $prepQueueDepth = Get-FioPreparationQueueDepth -Settings $Settings
-    $perJobThroughputCapBytesPerSec = if ($null -ne $Settings.ThroughputCapMBps) { Get-FioPerJobCapShare -TotalCap ([double]$Settings.ThroughputCapMBps * 1MB) -NumJobs $Settings.NumJobs } else { $null }
-    $perJobIopsCap = if ($null -ne $Settings.IopsCap) { Get-FioPerJobCapShare -TotalCap ([double]$Settings.IopsCap) -NumJobs $Settings.NumJobs } else { $null }
-    $effectiveCapMode = Get-FioEffectiveRateCapMode -PerJobThroughputCapBytesPerSec $perJobThroughputCapBytesPerSec -PerJobIopsCap $perJobIopsCap -BlockSizeBytes $Settings.BlockSizeBytes
+    $perJobThroughputCapBytesPerSec = if ($null -ne $Settings.EffectiveThroughputCapMBps) { Get-FioPerJobCapShare -TotalCap ([double]$Settings.EffectiveThroughputCapMBps * 1MB) -NumJobs $Settings.NumJobs } else { $null }
+    $perJobIopsCap = if ($null -ne $Settings.EffectiveIopsCap) { Get-FioPerJobCapShare -TotalCap ([double]$Settings.EffectiveIopsCap) -NumJobs $Settings.NumJobs } else { $null }
+    $effectiveCapMode = if ($Settings.PSObject.Properties['EffectiveLimiterMode']) { [string]$Settings.EffectiveLimiterMode } else { $null }
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('[global]')
@@ -1286,6 +1291,13 @@ function ConvertFrom-FioJsonToSummary {
         ReadWrite = $Settings.ReadWrite
         ReadMix = $Settings.ReadMix
         Fsync = $Settings.Fsync
+        RequestedThroughputCapMBps = $Settings.RequestedThroughputCapMBps
+        RequestedIopsCap = $Settings.RequestedIopsCap
+        EffectiveThroughputCapMBps = $Settings.EffectiveThroughputCapMBps
+        EffectiveIopsCap = $Settings.EffectiveIopsCap
+        EffectiveLimiterMode = $Settings.EffectiveLimiterMode
+        EffectiveLimiterBadge = $Settings.EffectiveLimiterBadge
+        LimiterSelectionReason = $Settings.LimiterSelectionReason
         CpuAffinity = Get-FioCpuAffinitySummary -Settings $Settings
         AggregateBandwidthMBps = [math]::Round(([double]$read.BandwidthMBps + [double]$write.BandwidthMBps), 2)
         AggregateIops = [math]::Round(([double]$read.Iops + [double]$write.Iops), 2)
@@ -3536,6 +3548,7 @@ function New-FioHtmlProfileComparisonSection {
                     [pscustomobject]@{ Key = 'Direct'; Label = 'direct'; Value = if ($null -ne $run.Direct) { [string]$run.Direct } else { $null } }
                     [pscustomobject]@{ Key = 'Fsync'; Label = 'fsync'; Value = if ($null -ne $run.Fsync -and $run.Fsync -gt 0) { [string]$run.Fsync } else { $null } }
                     [pscustomobject]@{ Key = 'RuntimeSec'; Label = 'runtime'; Value = if ($null -ne $run.RuntimeSec) { '{0}s' -f $run.RuntimeSec } else { $null } }
+                    [pscustomobject]@{ Key = 'Limiter'; Label = 'limit'; Value = if ($run.PSObject.Properties['EffectiveLimiterBadge']) { [string]$run.EffectiveLimiterBadge } else { $null } }
                 )
                 $runTargetSettings = @(
                     [pscustomobject]@{ Key = 'IterationCount'; Label = 'iters'; Value = if ($null -ne $run.IterationCount) { [string]$run.IterationCount } else { $null } }
@@ -4528,6 +4541,7 @@ function Export-FioSqlBenchHtmlReportStatic {
                 [pscustomobject]@{ Key = 'NumJobs'; Label = 'jobs'; Value = if ($null -ne $run.NumJobs) { [string]$run.NumJobs } else { $null } }
                 [pscustomobject]@{ Key = 'FileSizeGB'; Label = 'size'; Value = if ($null -ne $run.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$run.FileSizeGB, 0)) } else { $null } }
                 [pscustomobject]@{ Key = 'Iterations'; Label = 'iters'; Value = if ($null -ne $run.IterationCount) { [string]$run.IterationCount } else { $null } }
+                [pscustomobject]@{ Key = 'Limiter'; Label = 'limit'; Value = if ($run.PSObject.Properties['EffectiveLimiterBadge']) { [string]$run.EffectiveLimiterBadge } else { $null } }
                 [pscustomobject]@{ Key = 'AggregateBw'; Label = 'agg bw'; Value = if ($run.PSObject.Properties['AggregateBandwidthMBps'] -and $null -ne $run.AggregateBandwidthMBps -and [double]$run.AggregateBandwidthMBps -gt 0) { '{0:N2} MB/s' -f [double]$run.AggregateBandwidthMBps } else { $null } }
                 [pscustomobject]@{ Key = 'FioVersion'; Label = 'fio'; Value = [string]$run.FioVersion }
                 [pscustomobject]@{ Key = 'Server'; Label = 'server'; Value = if ($run.SmbMetadata) { [string]$run.SmbMetadata.ServerName } else { $null } }
