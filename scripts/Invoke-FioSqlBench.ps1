@@ -1839,8 +1839,6 @@ function Write-FioAllProfilePlan {
 
     foreach ($item in $Plan) {
         $prepMode = if (-not $item.PreparationRequired) { 'No prep' } elseif ($item.IsPreparationLeader) { 'Prep leader' } else { 'Reuse prep' }
-        [Nullable[decimal]]$ThroughputCapMBps,
-        [Nullable[int]]$IopsCap,
         $fileSizePerJobGb = [math]::Round(($item.Settings.FileSizePerJobBytes / 1GB), 2)
         $reuseSource = if (-not $item.PreparationRequired) { '-' } elseif ($item.IsPreparationLeader) { [string]$item.PreparationCacheGroup } else { '{0} via {1}' -f $item.PreparationLeaderProfile, $item.PreparationCacheGroup }
         Write-Host ('  {0,-15} {1,-12} {2,8} {3,14:N2} {4,-18}' -f $item.Profile, $prepMode, $item.Settings.NumJobs, $fileSizePerJobGb, $reuseSource) -ForegroundColor Gray
@@ -1891,8 +1889,6 @@ if ($Profile -eq 'All') {
         -Fsync $Fsync `
             -ThroughputCapMBps $ThroughputCapMBps `
             -IopsCap $IopsCap `
-        -ThroughputCapMBps $ThroughputCapMBps `
-        -IopsCap $IopsCap `
         -Direct $Direct
 
     $allTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
