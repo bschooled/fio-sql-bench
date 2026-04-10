@@ -1129,6 +1129,8 @@ function ConvertFrom-FioJsonToSummary {
         ReadMix = $Settings.ReadMix
         Fsync = $Settings.Fsync
         CpuAffinity = Get-FioCpuAffinitySummary -Settings $Settings
+        AggregateBandwidthMBps = [math]::Round(([double]$read.BandwidthMBps + [double]$write.BandwidthMBps), 2)
+        AggregateIops = [math]::Round(([double]$read.Iops + [double]$write.Iops), 2)
         Read = $read
         Write = $write
         Diagnostics = $diagnostics
@@ -1304,6 +1306,111 @@ function Get-FioDiagnosticsBandwidthStabilityModels {
     @($models)
 }
 
+function Read-FioPerfmonDiagnosticsCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $rows = @(
+        foreach ($row in @(Import-Csv -Path $Path -ErrorAction SilentlyContinue)) {
+        if ($null -eq $row) {
+            continue
+        }
+
+        $timeMs = $null
+        $value = $null
+        try {
+            $timeMs = [int]$row.TimeMs
+            $value = [double]$row.Value
+        }
+        catch {
+            continue
+        }
+
+            [pscustomobject]@{
+            TimeMs = $timeMs
+            Metric = [string]$row.Metric
+            Direction = [string]$row.Direction
+            Unit = [string]$row.Unit
+            Instance = [string]$row.Instance
+            Value = $value
+            }
+        }
+    )
+
+    @($rows)
+}
+
+function Get-FioDiagnosticsThrottlingModel {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Diagnostics
+    )
+
+    if ($null -eq $Diagnostics -or -not $Diagnostics.Available -or $null -eq $Diagnostics.Series) {
+        return [pscustomobject]@{
+            Available = $false
+            Active = $false
+            Label = 'No throttle evidence'
+            Detail = 'No SMB perf counter diagnostics were available.'
+        }
+    }
+
+    $queueSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonQueue' })
+    $latencySeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonLatency' })
+    $stallSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonCreditStalls' })
+
+    if (($queueSeries.Count + $latencySeries.Count + $stallSeries.Count) -eq 0) {
+        return [pscustomobject]@{
+            Available = $false
+            Active = $false
+            Label = 'No throttle evidence'
+            Detail = 'No SMB perf counter diagnostics were available.'
+        }
+    }
+
+    $queueMax = @($queueSeries | ForEach-Object { if ($_.Summary) { [double]$_.Summary.Max } }) | Measure-Object -Maximum
+    $latencyMax = @($latencySeries | ForEach-Object { if ($_.Summary) { [double]$_.Summary.Max } }) | Measure-Object -Maximum
+    $stallMax = @($stallSeries | ForEach-Object { if ($_.Summary) { [double]$_.Summary.Max } }) | Measure-Object -Maximum
+
+    $queueValue = if ($null -ne $queueMax.Maximum) { [double]$queueMax.Maximum } else { 0.0 }
+    $latencyValue = if ($null -ne $latencyMax.Maximum) { [double]$latencyMax.Maximum } else { 0.0 }
+    $stallValue = if ($null -ne $stallMax.Maximum) { [double]$stallMax.Maximum } else { 0.0 }
+    $active = (($queueValue -ge 1.0) -and ($latencyValue -ge 15.0)) -or ($stallValue -gt 0.0)
+
+    $detail = if ($active) {
+        'SMB client perf counters show queue growth, latency inflation, or credit stalls consistent with backend saturation or throttling.'
+    }
+    else {
+        'SMB client perf counters did not show strong signs of sustained queueing or credit stalls.'
+    }
+
+    [pscustomobject]@{
+        Available = $true
+        Active = $active
+        Label = if ($active) { 'Saturation signs' } else { 'No clear saturation' }
+        Detail = $detail
+        QueueDepthMax = [math]::Round($queueValue, 2)
+        ClientLatencyMaxMs = [math]::Round($latencyValue, 2)
+        CreditStallsMaxPerSec = [math]::Round($stallValue, 2)
+    }
+}
+
+function Get-FioAggregateBandwidthMBps {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Run
+    )
+
+    $readBandwidth = if ($Run.PSObject.Properties['Read'] -and $Run.Read.PSObject.Properties['BandwidthMBps']) { [double]$Run.Read.BandwidthMBps } else { 0.0 }
+    $writeBandwidth = if ($Run.PSObject.Properties['Write'] -and $Run.Write.PSObject.Properties['BandwidthMBps']) { [double]$Run.Write.BandwidthMBps } else { 0.0 }
+    [math]::Round(($readBandwidth + $writeBandwidth), 2)
+}
+
 function Get-FioDiagnosticsSummary {
     [CmdletBinding()]
     param(
@@ -1324,6 +1431,7 @@ function Get-FioDiagnosticsSummary {
             PresentMetrics = @($raw.PresentMetrics)
             Series = @()
             SourceFiles = @($raw.SourceFiles)
+            Throttling = Get-FioDiagnosticsThrottlingModel -Diagnostics $null
         }
     }
 
@@ -1355,7 +1463,7 @@ function Get-FioDiagnosticsSummary {
         }
     )
 
-    [pscustomobject]@{
+    $diagnostics = [pscustomobject]@{
         Requested = $false
         Available = $true
         Status = [string]$raw.Status
@@ -1367,6 +1475,9 @@ function Get-FioDiagnosticsSummary {
         Series = $series
         SourceFiles = @($raw.SourceFiles)
     }
+
+    $diagnostics | Add-Member -NotePropertyName Throttling -NotePropertyValue (Get-FioDiagnosticsThrottlingModel -Diagnostics $diagnostics)
+    return $diagnostics
 }
 
 function Get-FioDiagnosticsExpectations {
@@ -1379,6 +1490,9 @@ function Get-FioDiagnosticsExpectations {
         [pscustomobject]@{ Key = 'iops'; Label = 'IOPS' }
         [pscustomobject]@{ Key = 'latencyAvg'; Label = 'Avg Latency' }
         [pscustomobject]@{ Key = 'latencyMax'; Label = 'Max Latency' }
+        [pscustomobject]@{ Key = 'perfmonLatency'; Label = 'SMB Client Latency' }
+        [pscustomobject]@{ Key = 'perfmonQueue'; Label = 'SMB Queue' }
+        [pscustomobject]@{ Key = 'perfmonCreditStalls'; Label = 'SMB Credit Stalls' }
     )
 }
 
@@ -1456,6 +1570,45 @@ function Get-FioDiagnosticsData {
                 if (-not $pointBucket.ContainsKey($bucketKey)) {
                     $pointBucket[$bucketKey] = 0.0
                 }
+                $pointBucket[$bucketKey] = [double]$pointBucket[$bucketKey] + [double]$row.Value
+            }
+        }
+    }
+
+    foreach ($file in @(Get-ChildItem -LiteralPath $ResultDirectory -Filter '*-perfmon-smb.csv' -File -ErrorAction SilentlyContinue)) {
+        $sourceFiles.Add($file.FullName)
+        foreach ($row in @(Read-FioPerfmonDiagnosticsCsv -Path $file.FullName)) {
+            $seriesKey = '{0}-{1}' -f [string]$row.Metric, ([string]$row.Direction).ToLowerInvariant()
+            if (-not $seriesMap.Contains($seriesKey)) {
+                $label = switch ([string]$row.Metric) {
+                    'perfmonBandwidth' { '{0} SMB Throughput' -f [string]$row.Direction }
+                    'perfmonLatency' { '{0} SMB Client Latency' -f [string]$row.Direction }
+                    'perfmonQueue' { 'SMB Client Queue' }
+                    'perfmonCreditStalls' { 'SMB Credit Stalls' }
+                    default { '{0} {1}' -f [string]$row.Direction, [string]$row.Metric }
+                }
+
+                $seriesMap[$seriesKey] = [ordered]@{
+                    Key = $seriesKey
+                    Label = $label
+                    Metric = [string]$row.Metric
+                    Direction = [string]$row.Direction
+                    Unit = [string]$row.Unit
+                    PreferredDecimals = if (@('perfmonQueue', 'perfmonCreditStalls') -contains [string]$row.Metric) { 2 } else { 2 }
+                    PointsByTime = @{}
+                }
+            }
+
+            $pointBucket = $seriesMap[$seriesKey].PointsByTime
+            $bucketKey = [string]$row.TimeMs
+            if (-not $pointBucket.ContainsKey($bucketKey)) {
+                $pointBucket[$bucketKey] = 0.0
+            }
+
+            if (@('perfmonQueue', 'perfmonCreditStalls') -contains [string]$row.Metric) {
+                $pointBucket[$bucketKey] = [math]::Max([double]$pointBucket[$bucketKey], [double]$row.Value)
+            }
+            else {
                 $pointBucket[$bucketKey] = [double]$pointBucket[$bucketKey] + [double]$row.Value
             }
         }
@@ -2164,6 +2317,7 @@ function Get-FioHistoryRunAggregate {
             PresentMetrics = if ($rawDiagnostics.PSObject.Properties['PresentMetrics']) { @($rawDiagnostics.PresentMetrics) } else { @() }
             Series = if ($rawDiagnostics.PSObject.Properties['Series']) { @($rawDiagnostics.Series) } else { @() }
             SourceFiles = if ($rawDiagnostics.PSObject.Properties['SourceFiles']) { @($rawDiagnostics.SourceFiles) } else { @() }
+            Throttling = if ($rawDiagnostics.PSObject.Properties['Throttling']) { $rawDiagnostics.Throttling } else { Get-FioDiagnosticsThrottlingModel -Diagnostics $rawDiagnostics }
         }
     }
     else {
@@ -2178,6 +2332,7 @@ function Get-FioHistoryRunAggregate {
             PresentMetrics = @()
             Series = @()
             SourceFiles = @()
+            Throttling = Get-FioDiagnosticsThrottlingModel -Diagnostics $null
         }
     }
 
@@ -2231,6 +2386,8 @@ function Get-FioHistoryRunAggregate {
         ReadMix = if ($first.PSObject.Properties['ReadMix']) { $first.ReadMix } else { $null }
         Fsync = if ($first.PSObject.Properties['Fsync']) { [int]$first.Fsync } else { $null }
         CpuAffinity = if ($RootSummary.PSObject.Properties['CpuAffinity']) { $RootSummary.CpuAffinity } elseif ($first.PSObject.Properties['CpuAffinity']) { $first.CpuAffinity } else { $null }
+        AggregateBandwidthMBps = [math]::Round(([double]$read.BandwidthMBps + [double]$write.BandwidthMBps), 2)
+        AggregateIops = [math]::Round(([double]$read.Iops + [double]$write.Iops), 2)
         Read = $read
         Write = $write
         Diagnostics = $normalizedDiagnostics
@@ -2749,6 +2906,11 @@ function Get-FioHtmlOverallAssessmentModel {
         return [pscustomobject]@{ Label = 'No data'; Class = 'assessment-neutral'; Rank = 7; Operation = $null }
     }
 
+    $throttlingModel = if ($Run.PSObject.Properties['Diagnostics']) { Get-FioDiagnosticsThrottlingModel -Diagnostics $Run.Diagnostics } else { $null }
+    if ($null -ne $throttlingModel -and $throttlingModel.Available -and $throttlingModel.Active -and @('MaxThroughput', 'BackupRestore') -contains [string]$Run.Profile -and [string]$Run.TargetType -eq 'Smb' -and $worstRow.AssessmentRank -ge 3) {
+        return [pscustomobject]@{ Label = 'Saturated'; Class = 'assessment-neutral'; Rank = 2; Operation = 'Aggregate' }
+    }
+
     [pscustomobject]@{
         Label = $worstRow.DisplayStatus
         Class = $worstRow.AssessmentClass
@@ -2821,6 +2983,11 @@ function Get-FioHtmlSqlFitBlurb {
     $rows = @(Get-FioHtmlActiveAssessmentRows -Run $Run)
     $focusRow = @($rows | Sort-Object @{ Expression = { $_.AssessmentRank }; Descending = $true }, @{ Expression = { $_.MeanMs }; Descending = $true } | Select-Object -First 1)[0]
     $focusNote = if ($null -ne $focusRow -and @($focusRow.Notes).Count -gt 0) { [string](@($focusRow.Notes | Select-Object -Unique)[0]) } else { $null }
+    $throttlingModel = if ($Run.PSObject.Properties['Diagnostics']) { Get-FioDiagnosticsThrottlingModel -Diagnostics $Run.Diagnostics } else { $null }
+    if ($null -ne $throttlingModel -and $throttlingModel.Available -and $throttlingModel.Active -and @('MaxThroughput', 'BackupRestore') -contains [string]$Run.Profile -and [string]$Run.TargetType -eq 'Smb') {
+        $aggregateBandwidth = Get-FioAggregateBandwidthMBps -Run $Run
+        $focusNote = ('Observed aggregate throughput is {0:N2} MB/s while SMB client counters show queueing or credit stalls. Treat this as saturation evidence before reading the run as an outright storage miss.' -f $aggregateBandwidth)
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($targetText) -and -not [string]::IsNullOrWhiteSpace($focusNote)) {
         return ('{0} {1}' -f $targetText, $focusNote)
@@ -3238,6 +3405,10 @@ function New-FioHtmlLineChartSection {
                 'latencymax-read' = '#60a5fa'
                 'latencyavg-write' = '#7c3aed'
                 'latencymax-write' = '#c084fc'
+            'perfmonlatency-read' = '#1d4ed8'
+            'perfmonlatency-write' = '#db2777'
+            'perfmonqueue-client' = '#4f46e5'
+            'perfmoncreditstalls-client' = '#dc2626'
         }
 
         $seriesMarkup = New-Object System.Collections.Generic.List[string]
@@ -3326,6 +3497,10 @@ function New-FioHtmlDiagnosticsSection {
                 [pscustomobject]@{ Label = 'Source files'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['SourceFiles']) { [string](@($Diagnostics.SourceFiles).Count) } else { '0' } }
         )
 
+        if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['Throttling'] -and $null -ne $Diagnostics.Throttling -and $Diagnostics.Throttling.PSObject.Properties['Available'] -and $Diagnostics.Throttling.Available) {
+            $summaryItems += [pscustomobject]@{ Label = 'Saturation'; Value = [string]$Diagnostics.Throttling.Label }
+        }
+
         if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['MissingMetrics'] -and @($Diagnostics.MissingMetrics).Count -gt 0) {
             $summaryItems += [pscustomobject]@{ Label = 'Missing'; Value = (@($Diagnostics.MissingMetrics) -join ', ') }
         }
@@ -3359,11 +3534,23 @@ function New-FioHtmlDiagnosticsSection {
         $stabilitySeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidthStability' })
         $iopsSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'iops' })
         $latencySeries = @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' })
+        $perfmonLatencySeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonLatency' })
+        $perfmonQueueSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonQueue' })
+        $perfmonCreditStallSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonCreditStalls' })
         $cards = New-Object System.Collections.Generic.List[string]
         $cards.Add((New-FioHtmlLineChartSection -Title 'Throughput Over Time' -Series $throughputSeries -Subtitle ('Windowed fio bandwidth logs sampled every {0} ms.' -f $Diagnostics.LogWindowMs)))
         $cards.Add((New-FioHtmlLineChartSection -Title 'BW Stability Over Time' -Series $stabilitySeries -Subtitle ('Rolling {0}-sample coefficient of variation from fio bandwidth logs. Lower is steadier.' -f $script:FioDiagnosticsStabilityWindowSamples)))
         $cards.Add((New-FioHtmlLineChartSection -Title 'IOPS Over Time' -Series $iopsSeries -Subtitle ('Windowed fio IOPS logs sampled every {0} ms.' -f $Diagnostics.LogWindowMs)))
         $cards.Add((New-FioHtmlLineChartSection -Title 'Completion Latency Over Time' -Series $latencySeries -Subtitle ('Average and max completion latency from fio clat logs, useful for spotting stalls and throttling.' -f $Diagnostics.LogWindowMs)))
+        if ($perfmonLatencySeries.Count -gt 0) {
+            $cards.Add((New-FioHtmlLineChartSection -Title 'SMB Client Latency Over Time' -Series $perfmonLatencySeries -Subtitle 'PerfMon SMB client read/write latency counters. This is client-observed SMB latency, useful for spotting queueing beyond storage-service latency.'))
+        }
+        if ($perfmonQueueSeries.Count -gt 0) {
+            $cards.Add((New-FioHtmlLineChartSection -Title 'SMB Queue Over Time' -Series $perfmonQueueSeries -Subtitle 'PerfMon SMB client queue depth. Sustained growth here is a strong saturation signal when throughput plateaus.'))
+        }
+        if ($perfmonCreditStallSeries.Count -gt 0) {
+            $cards.Add((New-FioHtmlLineChartSection -Title 'SMB Credit Stalls Over Time' -Series $perfmonCreditStallSeries -Subtitle 'PerfMon SMB credit stalls per second. Non-zero values suggest the SMB client is being gated while the path is saturated.'))
+        }
 
         return @"
 <section class='table-card diagnostics-card'>
@@ -3402,6 +3589,10 @@ function Get-FioDiagnosticsSeriesColor {
         'latencymax-read' { return '#60a5fa' }
         'latencyavg-write' { return '#7c3aed' }
         'latencymax-write' { return '#c084fc' }
+        'perfmonlatency-read' { return '#1d4ed8' }
+        'perfmonlatency-write' { return '#db2777' }
+        'perfmonqueue-client' { return '#4f46e5' }
+        'perfmoncreditstalls-client' { return '#dc2626' }
         default { return '#1f2937' }
     }
 }
@@ -3451,6 +3642,9 @@ function Get-FioDiagnosticsChartModels {
         [pscustomobject]@{ Key = 'bandwidthStability'; Title = 'BW Stability Over Time'; Subtitle = 'Rolling bandwidth coefficient of variation. Lower percentages indicate steadier delivery.'; YAxisTitle = 'CV %' }
         [pscustomobject]@{ Key = 'iops'; Title = 'IOPS Over Time'; Subtitle = 'Windowed fio IOPS samples across the selected run.'; YAxisTitle = 'IOPS' }
         [pscustomobject]@{ Key = 'latency'; Title = 'Completion Latency Over Time'; Subtitle = 'Average and max completion latency, useful for spotting stalls and throttling.'; YAxisTitle = 'Milliseconds' }
+        [pscustomobject]@{ Key = 'perfmonLatency'; Title = 'SMB Client Latency Over Time'; Subtitle = 'PerfMon SMB client read/write latency counters captured on the benchmark host.'; YAxisTitle = 'Milliseconds' }
+        [pscustomobject]@{ Key = 'perfmonQueue'; Title = 'SMB Queue Over Time'; Subtitle = 'PerfMon SMB client queue depth. Sustained buildup usually means the path is saturated or being throttled.'; YAxisTitle = 'Queue depth' }
+        [pscustomobject]@{ Key = 'perfmonCreditStalls'; Title = 'SMB Credit Stalls Over Time'; Subtitle = 'PerfMon SMB credit stalls per second. Non-zero values suggest client-side flow control while saturated.'; YAxisTitle = 'Stalls/sec' }
     )
 
     $models = New-Object System.Collections.Generic.List[object]
@@ -3664,6 +3858,9 @@ function Export-FioSqlBenchHtmlReportStatic {
                     'bandwidthStability' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'bandwidthStability' }) }
                         'iops' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'iops' }) }
                         'latency' { return @($Diagnostics.Series | Where-Object { $_.Metric -like 'latency*' }) }
+                    'perfmonLatency' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonLatency' }) }
+                    'perfmonQueue' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonQueue' }) }
+                    'perfmonCreditStalls' { return @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonCreditStalls' }) }
                         default { return @() }
                 }
         }
@@ -3934,6 +4131,7 @@ function Export-FioSqlBenchHtmlReportStatic {
                 [pscustomobject]@{ Key = 'NumJobs'; Label = 'jobs'; Value = if ($null -ne $run.NumJobs) { [string]$run.NumJobs } else { $null } }
                 [pscustomobject]@{ Key = 'FileSizeGB'; Label = 'size'; Value = if ($null -ne $run.FileSizeGB) { '{0} GB' -f ([math]::Round([double]$run.FileSizeGB, 0)) } else { $null } }
                 [pscustomobject]@{ Key = 'Iterations'; Label = 'iters'; Value = if ($null -ne $run.IterationCount) { [string]$run.IterationCount } else { $null } }
+                [pscustomobject]@{ Key = 'AggregateBw'; Label = 'agg bw'; Value = if ($run.PSObject.Properties['AggregateBandwidthMBps'] -and $null -ne $run.AggregateBandwidthMBps -and [double]$run.AggregateBandwidthMBps -gt 0) { '{0:N2} MB/s' -f [double]$run.AggregateBandwidthMBps } else { $null } }
                 [pscustomobject]@{ Key = 'FioVersion'; Label = 'fio'; Value = [string]$run.FioVersion }
                 [pscustomobject]@{ Key = 'Server'; Label = 'server'; Value = if ($run.SmbMetadata) { [string]$run.SmbMetadata.ServerName } else { $null } }
                 [pscustomobject]@{ Key = 'Share'; Label = 'share'; Value = if ($run.SmbMetadata) { [string]$run.SmbMetadata.ShareName } else { $null } }

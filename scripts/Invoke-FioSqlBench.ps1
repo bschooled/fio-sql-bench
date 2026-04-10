@@ -74,7 +74,7 @@ Explicit path to `fio.exe`. If omitted, the script searches PATH, installed
 program entries, and common Program Files locations.
 
 .PARAMETER EnableLogs
-Adds fio bandwidth, IOPS, and latency log files to the result set so diagnostics can chart throughput stability and transient stalls.
+Adds fio bandwidth, IOPS, and latency log files to the result set so diagnostics can chart throughput stability and transient stalls. On SMB targets, the runner also attempts to capture SMB client perf counters for queueing, credit stalls, and client-observed latency.
 
 .PARAMETER KeepJobFile
 Preserves the generated `.fio` job file in the results directory.
@@ -213,6 +213,168 @@ function Move-FioIterationDiagnosticLogs {
     }
 
     @($movedPaths)
+}
+
+function Get-FioSmbPerfmonCollectorSpec {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$TargetInfo
+    )
+
+    if ($TargetInfo.Type -ne 'Smb' -or $null -eq $TargetInfo.SmbMetadata) {
+        return $null
+    }
+
+    try {
+        $listSet = Get-Counter -ListSet 'SMB Client Shares' -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+
+    $availableCounters = @($listSet.Counter)
+    $definitions = @(
+        [pscustomobject]@{ CounterPath = '\SMB Client Shares(*)\Read Bytes/sec'; CounterName = 'Read Bytes/sec'; Metric = 'perfmonBandwidth'; Direction = 'Read'; Unit = 'MB/s'; Divisor = [double]1MB },
+        [pscustomobject]@{ CounterPath = '\SMB Client Shares(*)\Write Bytes/sec'; CounterName = 'Write Bytes/sec'; Metric = 'perfmonBandwidth'; Direction = 'Write'; Unit = 'MB/s'; Divisor = [double]1MB },
+        [pscustomobject]@{ CounterPath = '\SMB Client Shares(*)\Avg. sec/Read'; CounterName = 'Avg. sec/Read'; Metric = 'perfmonLatency'; Direction = 'Read'; Unit = 'ms'; Divisor = 0.001 },
+        [pscustomobject]@{ CounterPath = '\SMB Client Shares(*)\Avg. sec/Write'; CounterName = 'Avg. sec/Write'; Metric = 'perfmonLatency'; Direction = 'Write'; Unit = 'ms'; Divisor = 0.001 },
+        [pscustomobject]@{ CounterPath = '\SMB Client Shares(*)\Current Data Queue Length'; CounterName = 'Current Data Queue Length'; Metric = 'perfmonQueue'; Direction = 'Client'; Unit = 'queue depth'; Divisor = 1.0 },
+        [pscustomobject]@{ CounterPath = '\SMB Client Shares(*)\Credit Stalls/sec'; CounterName = 'Credit Stalls/sec'; Metric = 'perfmonCreditStalls'; Direction = 'Client'; Unit = 'stalls/sec'; Divisor = 1.0 }
+    )
+
+    $enabledDefinitions = @(
+        foreach ($definition in $definitions) {
+            if ($availableCounters -contains $definition.CounterPath) {
+                $definition
+            }
+        }
+    )
+
+    if ($enabledDefinitions.Count -eq 0) {
+        return $null
+    }
+
+    [pscustomobject]@{
+        ShareName = if ($TargetInfo.SmbMetadata.PSObject.Properties['ShareName']) { [string]$TargetInfo.SmbMetadata.ShareName } else { $null }
+        ServerName = if ($TargetInfo.SmbMetadata.PSObject.Properties['ServerName']) { [string]$TargetInfo.SmbMetadata.ServerName } else { $null }
+        Definitions = $enabledDefinitions
+        SampleIntervalMs = 1000
+    }
+}
+
+function Start-FioSmbPerfmonCapture {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$CollectorSpec,
+
+        [Parameter(Mandatory)]
+        [string]$OutputPath
+    )
+
+    $stopPath = "$OutputPath.stop"
+    if (Test-Path -LiteralPath $stopPath) {
+        Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $job = Start-Job -ScriptBlock {
+        param($Definitions, $OutputPath, $StopPath, $ShareName, $ServerName, $SampleIntervalMs)
+
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        'TimeMs,Metric,Direction,Unit,Instance,Value' | Set-Content -Path $OutputPath -Encoding utf8
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $shareToken = if ([string]::IsNullOrWhiteSpace([string]$ShareName)) { $null } else { ([string]$ShareName).ToLowerInvariant() }
+        $serverToken = if ([string]::IsNullOrWhiteSpace([string]$ServerName)) { $null } else { ([string]$ServerName).ToLowerInvariant() }
+
+        while (-not (Test-Path -LiteralPath $StopPath)) {
+            try {
+                $counterPaths = @($Definitions | ForEach-Object { [string]$_.CounterPath } | Select-Object -Unique)
+                $sample = Get-Counter -Counter $counterPaths -ErrorAction Stop
+                $rows = New-Object System.Collections.Generic.List[string]
+                foreach ($counterSample in @($sample.CounterSamples)) {
+                    $definition = @($Definitions | Where-Object { $counterSample.Path -like ('*\' + $_.CounterName) } | Select-Object -First 1)
+                    if ($definition.Count -eq 0) {
+                        continue
+                    }
+
+                    $instanceName = if ($counterSample.PSObject.Properties['InstanceName']) { [string]$counterSample.InstanceName } else { [string]$counterSample.Path }
+                    $instanceToken = $instanceName.ToLowerInvariant()
+                    $instanceMatches = $true
+                    if (-not [string]::IsNullOrWhiteSpace($shareToken)) {
+                        $instanceMatches = $instanceToken.Contains($shareToken)
+                    }
+                    if (-not $instanceMatches -and -not [string]::IsNullOrWhiteSpace($serverToken)) {
+                        $instanceMatches = $instanceToken.Contains($serverToken)
+                    }
+                    if (-not $instanceMatches) {
+                        continue
+                    }
+
+                    $value = [double]$counterSample.CookedValue
+                    if ($definition.Divisor -ne 1.0) {
+                        $value = $value / [double]$definition.Divisor
+                    }
+
+                    $rows.Add(('{0},{1},{2},{3},"{4}",{5}' -f [int]$stopwatch.ElapsedMilliseconds, $definition.Metric, $definition.Direction, $definition.Unit, ($instanceName -replace '"', '""'), [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:0.####}', $value)))
+                }
+
+                if ($rows.Count -gt 0) {
+                    Add-Content -Path $OutputPath -Value $rows -Encoding utf8
+                }
+            }
+            catch {
+            }
+
+            Start-Sleep -Milliseconds $SampleIntervalMs
+        }
+    } -ArgumentList @($CollectorSpec.Definitions, $OutputPath, $stopPath, $CollectorSpec.ShareName, $CollectorSpec.ServerName, $CollectorSpec.SampleIntervalMs)
+
+    [pscustomobject]@{
+        Job = $job
+        OutputPath = $OutputPath
+        StopPath = $stopPath
+    }
+}
+
+function Stop-FioSmbPerfmonCapture {
+    param(
+        [AllowNull()]
+        [pscustomobject]$Capture
+    )
+
+    if ($null -eq $Capture) {
+        return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Capture.StopPath)) {
+        New-Item -ItemType File -Path $Capture.StopPath -Force | Out-Null
+    }
+
+    if ($Capture.PSObject.Properties['Job'] -and $null -ne $Capture.Job) {
+        try {
+            Wait-Job -Job $Capture.Job -Timeout 5 | Out-Null
+        }
+        catch {
+        }
+
+        try {
+            if ($Capture.Job.State -eq 'Running') {
+                Stop-Job -Job $Capture.Job -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+        }
+
+        try {
+            Remove-Job -Job $Capture.Job -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Capture.StopPath) -and (Test-Path -LiteralPath $Capture.StopPath)) {
+        Remove-Item -LiteralPath $Capture.StopPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Write-FioStage {
@@ -1628,18 +1790,32 @@ try {
         $iterationPrefix = 'iter-{0:D2}' -f $iteration
         $iterationJsonPath = Join-Path -Path $runContext.ResultDirectory -ChildPath ("$iterationPrefix-fio.json")
         $iterationConsolePath = Join-Path -Path $runContext.ResultDirectory -ChildPath ("$iterationPrefix-console.log")
+        $iterationPerfmonPath = Join-Path -Path $runContext.ResultDirectory -ChildPath ("$iterationPrefix-perfmon-smb.csv")
+        $perfmonCapture = $null
 
         Write-FioStage -Title ("Running fio iteration {0} of {1}" -f $iteration, $effectiveSettings.Iterations) -Status 'RUN'
         Write-FioProperty -Name 'JSON output' -Value $iterationJsonPath
         Write-FioProperty -Name 'Console log' -Value $iterationConsolePath
+        if ($EnableLogs -and $resolvedTarget.Type -eq 'Smb') {
+            $perfmonCollectorSpec = Get-FioSmbPerfmonCollectorSpec -TargetInfo $resolvedTarget
+            if ($null -ne $perfmonCollectorSpec) {
+                $perfmonCapture = Start-FioSmbPerfmonCapture -CollectorSpec $perfmonCollectorSpec -OutputPath $iterationPerfmonPath
+                Write-FioProperty -Name 'PerfMon log' -Value $iterationPerfmonPath
+            }
+        }
 
         # Keep raw fio artifacts per iteration so failures are diagnosable without
         # re-running the benchmark.
-        Invoke-FioSqlBenchRun `
-            -FioPath $fioBinary.Path `
-            -JobFilePath $jobFilePath `
-            -OutputJsonPath $iterationJsonPath `
-            -ConsoleLogPath $iterationConsolePath
+        try {
+            Invoke-FioSqlBenchRun `
+                -FioPath $fioBinary.Path `
+                -JobFilePath $jobFilePath `
+                -OutputJsonPath $iterationJsonPath `
+                -ConsoleLogPath $iterationConsolePath
+        }
+        finally {
+            Stop-FioSmbPerfmonCapture -Capture $perfmonCapture
+        }
 
         $summary = ConvertFrom-FioJsonToSummary `
             -JsonPath $iterationJsonPath `
@@ -1651,8 +1827,12 @@ try {
 
         $summary.Diagnostics.Requested = [bool]$EnableLogs
         $iterationDiagnosticLogPaths = Move-FioIterationDiagnosticLogs -ResultDirectory $runContext.ResultDirectory -IterationPrefix $iterationPrefix
+        $additionalDiagnosticFiles = New-Object System.Collections.Generic.List[string]
+        if (Test-Path -LiteralPath $iterationPerfmonPath) {
+            $additionalDiagnosticFiles.Add($iterationPerfmonPath)
+        }
         if ($summary.PSObject.Properties['Diagnostics'] -and $summary.Diagnostics.Available) {
-            $summary.Diagnostics.SourceFiles = @($iterationDiagnosticLogPaths)
+            $summary.Diagnostics.SourceFiles = @($iterationDiagnosticLogPaths + $additionalDiagnosticFiles)
             $iterationDiagnosticsCsvPath = Join-Path -Path $runContext.ResultDirectory -ChildPath ("$iterationPrefix-diagnostics.csv")
             Export-FioSqlBenchDiagnosticsCsv -Diagnostics $summary.Diagnostics -Path $iterationDiagnosticsCsvPath
         }
@@ -1662,9 +1842,9 @@ try {
             $summary.Diagnostics.SourceFiles = @()
         }
         else {
-            $summary.Diagnostics.SourceFiles = @($iterationDiagnosticLogPaths)
+            $summary.Diagnostics.SourceFiles = @($iterationDiagnosticLogPaths + $additionalDiagnosticFiles)
             if ([string]::IsNullOrWhiteSpace([string]$summary.Diagnostics.Message)) {
-                $summary.Diagnostics.Message = 'Diagnostics were requested, but no chartable fio telemetry was captured for this iteration.'
+                $summary.Diagnostics.Message = 'Diagnostics were requested, but no chartable fio or SMB perf counter telemetry was captured for this iteration.'
             }
         }
 
