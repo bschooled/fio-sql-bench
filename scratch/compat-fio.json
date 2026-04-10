@@ -1,1 +1,0 @@
-﻿{"jobs":[{"jobname":"bench-01","read":{"bw_bytes":1048576,"io_bytes":1048576,"iops":128,"runtime":1000,"clat_ns":{"N":1,"mean":1000,"percentile":{"50.000000":1000,"95.000000":1000,"99.000000":1000,"99.900000":1000}}},"write":{"bw_bytes":0,"io_bytes":0,"iops":0,"runtime":0}}]}

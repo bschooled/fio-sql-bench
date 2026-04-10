@@ -26,9 +26,9 @@ Raw device benchmarking is intentionally blocked to reduce destructive risk.
 ## Prerequisites
 
 - PowerShell 7 or Windows PowerShell 5.1
-- A vendored `fio.exe` under `tools/fio/windows-x64`, or `fio.exe` installed and available on `PATH`, or passed with `-FioPath`
-  - This repo now prefers a tracked local copy under `tools/fio/windows-x64` before checking machine-wide installs.
-  - If you need to refresh the bundled binary, replace the files in `tools/fio/windows-x64` and commit them with the repo.
+- A local `fio.exe` under `tools/fio/windows-x64`, or `fio.exe` installed and available on `PATH`, or passed with `-FioPath`
+  - The runner prefers a repo-local copy under `tools/fio/windows-x64` before checking machine-wide installs.
+  - The `tools/fio/` folder is intended for local machine setup and is ignored by git.
   - You can find *fio* from the releases page of [Fio](https://github.com/axboe/fio)
 - Permission to create a dedicated test directory on the target volume or SMB share
 
@@ -39,13 +39,6 @@ The script looks for `fio.exe` in:
 - `PATH`
 - `C:\Program Files\fio\fio.exe`
 - `C:\Program Files (x86)\fio\fio.exe`
-
-Bundled external resources:
-
-- `tools/fio/windows-x64/fio.exe`
-- `tools/fio/windows-x64/COPYING.txt`
-- `tools/fio/windows-x64/README.txt`
-- `tools/fio/windows-x64/HOWTO.txt`
 
 ## Workload Profiles
 

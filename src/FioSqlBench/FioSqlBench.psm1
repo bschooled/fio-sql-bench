@@ -873,7 +873,7 @@ function Resolve-FioBinary {
         [string]$ExplicitPath
     )
 
-    # Prefer a vendored fio binary in the repository, then fall back to explicit
+    # Prefer a repo-local fio binary when present, then fall back to explicit
     # overrides and machine-level installation discovery.
     $candidates = New-Object System.Collections.Generic.List[string]
     if ($ExplicitPath) {
@@ -910,7 +910,7 @@ function Resolve-FioBinary {
         }
     }
 
-    throw 'Unable to find fio.exe. Add a vendored copy under tools/fio, install fio, add it to PATH, or pass -FioPath explicitly.'
+    throw 'Unable to find fio.exe. Add a local copy under tools/fio, install fio, add it to PATH, or pass -FioPath explicitly.'
 }
 
 function Get-FioRepoBinaryCandidates {
