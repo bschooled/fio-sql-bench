@@ -3,6 +3,26 @@ $ErrorActionPreference = 'Stop'
 
 $script:FioDiagnosticsWindowMs = 1000
 $script:FioDiagnosticsStabilityWindowSamples = 5
+$script:FioConvertFromJsonSupportsDepth = $null
+
+function ConvertFrom-FioJsonDocument {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$InputObject
+    )
+
+    if ($null -eq $script:FioConvertFromJsonSupportsDepth) {
+        $convertFromJsonCommand = Get-Command -Name 'ConvertFrom-Json' -ErrorAction Stop
+        $script:FioConvertFromJsonSupportsDepth = $convertFromJsonCommand.Parameters.ContainsKey('Depth')
+    }
+
+    if ($script:FioConvertFromJsonSupportsDepth) {
+        return ($InputObject | ConvertFrom-Json -Depth 100)
+    }
+
+    return ($InputObject | ConvertFrom-Json)
+}
 
 function Remove-FioNullPadding {
     [CmdletBinding()]
@@ -853,12 +873,15 @@ function Resolve-FioBinary {
         [string]$ExplicitPath
     )
 
-    # Windows installs are often present without PATH being updated, so resolution
-    # walks from the explicit override to PATH, installed-program metadata, and
-    # finally a few conventional Program Files locations.
+    # Prefer a vendored fio binary in the repository, then fall back to explicit
+    # overrides and machine-level installation discovery.
     $candidates = New-Object System.Collections.Generic.List[string]
     if ($ExplicitPath) {
         $candidates.Add($ExplicitPath)
+    }
+
+    foreach ($repoLocalPath in Get-FioRepoBinaryCandidates) {
+        $candidates.Add($repoLocalPath)
     }
 
     $command = Get-Command -Name 'fio.exe' -ErrorAction SilentlyContinue
@@ -887,7 +910,25 @@ function Resolve-FioBinary {
         }
     }
 
-    throw 'Unable to find fio.exe. Install fio, add it to PATH, or pass -FioPath explicitly.'
+    throw 'Unable to find fio.exe. Add a vendored copy under tools/fio, install fio, add it to PATH, or pass -FioPath explicitly.'
+}
+
+function Get-FioRepoBinaryCandidates {
+    [CmdletBinding()]
+    param()
+
+    $repoRoot = Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($relativePath in @(
+        'tools\fio\windows-x64\fio.exe',
+        'tools\fio\fio.exe',
+        'vendor\fio\windows-x64\fio.exe',
+        'vendor\fio\fio.exe'
+    )) {
+        $paths.Add((Join-Path -Path $repoRoot -ChildPath $relativePath))
+    }
+
+    $paths | Select-Object -Unique
 }
 
 function Get-FioInstalledProgramCandidates {
@@ -1059,7 +1100,7 @@ function ConvertFrom-FioJsonToSummary {
         [pscustomobject]$TargetInfo
     )
 
-    $fio = Get-Content -LiteralPath $JsonPath -Raw | ConvertFrom-Json -Depth 100
+    $fio = ConvertFrom-FioJsonDocument -InputObject (Get-Content -LiteralPath $JsonPath -Raw)
     $jobs = @($fio.jobs | Where-Object { $_.jobname -like 'bench*' })
     if ($jobs.Count -eq 0) {
         $jobs = @($fio.jobs)
@@ -2221,7 +2262,7 @@ function Import-FioSqlBenchHistory {
 
     $summaryFiles = @(Get-ChildItem -LiteralPath $ResultsRoot -Filter 'summary.json' -Recurse -File | Sort-Object FullName)
     $runs = foreach ($file in $summaryFiles) {
-        $rootSummary = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json -Depth 100
+        $rootSummary = ConvertFrom-FioJsonDocument -InputObject (Get-Content -LiteralPath $file.FullName -Raw)
         $iterations = if ($rootSummary.PSObject.Properties['Iterations']) {
             @($rootSummary.Iterations)
         }
