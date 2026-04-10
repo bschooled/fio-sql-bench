@@ -554,6 +554,37 @@ function ConvertTo-FioRateLiteral {
     return ('{0},{1}' -f [int64][math]::Max(1, [math]::Round($ReadValue, 0)), [int64][math]::Max(1, [math]::Round($WriteValue, 0)))
 }
 
+function Get-FioEffectiveRateCapMode {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][double]$PerJobThroughputCapBytesPerSec,
+
+        [AllowNull()][double]$PerJobIopsCap,
+
+        [Parameter(Mandatory)]
+        [int64]$BlockSizeBytes
+    )
+
+    if (($null -eq $PerJobThroughputCapBytesPerSec -or $PerJobThroughputCapBytesPerSec -le 0) -and ($null -eq $PerJobIopsCap -or $PerJobIopsCap -le 0)) {
+        return $null
+    }
+
+    if ($null -eq $PerJobIopsCap -or $PerJobIopsCap -le 0) {
+        return 'throughput'
+    }
+
+    if ($null -eq $PerJobThroughputCapBytesPerSec -or $PerJobThroughputCapBytesPerSec -le 0) {
+        return 'iops'
+    }
+
+    $iopsEquivalentBytesPerSec = [double]$PerJobIopsCap * [double]$BlockSizeBytes
+    if ($PerJobThroughputCapBytesPerSec -le $iopsEquivalentBytesPerSec) {
+        return 'throughput'
+    }
+
+    return 'iops'
+}
+
 function Get-FioCpuTopology {
     [CmdletBinding()]
     param()
@@ -796,6 +827,7 @@ function New-FioSqlBenchJobContent {
     $prepQueueDepth = Get-FioPreparationQueueDepth -Settings $Settings
     $perJobThroughputCapBytesPerSec = if ($null -ne $Settings.ThroughputCapMBps) { Get-FioPerJobCapShare -TotalCap ([double]$Settings.ThroughputCapMBps * 1MB) -NumJobs $Settings.NumJobs } else { $null }
     $perJobIopsCap = if ($null -ne $Settings.IopsCap) { Get-FioPerJobCapShare -TotalCap ([double]$Settings.IopsCap) -NumJobs $Settings.NumJobs } else { $null }
+    $effectiveCapMode = Get-FioEffectiveRateCapMode -PerJobThroughputCapBytesPerSec $perJobThroughputCapBytesPerSec -PerJobIopsCap $perJobIopsCap -BlockSizeBytes $Settings.BlockSizeBytes
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('[global]')
@@ -829,10 +861,10 @@ function New-FioSqlBenchJobContent {
             $iopsCaps = Get-FioDirectionalCapValues -Settings $Settings -ReadWrite ([string]$Settings.ReadWrite) -PerJobCap $perJobIopsCap
             $rateLiteral = if ($null -ne $throughputCaps) { ConvertTo-FioRateLiteral -ReadValue $throughputCaps.Read -WriteValue $throughputCaps.Write } else { $null }
             $rateIopsLiteral = if ($null -ne $iopsCaps) { ConvertTo-FioRateLiteral -ReadValue $iopsCaps.Read -WriteValue $iopsCaps.Write } else { $null }
-            if (-not [string]::IsNullOrWhiteSpace($rateLiteral)) {
+            if ($effectiveCapMode -eq 'throughput' -and -not [string]::IsNullOrWhiteSpace($rateLiteral)) {
                 $lines.Add("rate=$rateLiteral")
             }
-            if (-not [string]::IsNullOrWhiteSpace($rateIopsLiteral)) {
+            if ($effectiveCapMode -eq 'iops' -and -not [string]::IsNullOrWhiteSpace($rateIopsLiteral)) {
                 $lines.Add("rate_iops=$rateIopsLiteral")
             }
         }
@@ -898,10 +930,10 @@ function New-FioSqlBenchJobContent {
                     $iopsCaps = Get-FioDirectionalCapValues -Settings $Settings -ReadWrite ([string]$operation.Rw) -PerJobCap $perJobIopsCap
                     $rateLiteral = if ($null -ne $throughputCaps) { ConvertTo-FioRateLiteral -ReadValue $throughputCaps.Read -WriteValue $throughputCaps.Write } else { $null }
                     $rateIopsLiteral = if ($null -ne $iopsCaps) { ConvertTo-FioRateLiteral -ReadValue $iopsCaps.Read -WriteValue $iopsCaps.Write } else { $null }
-                    if (-not [string]::IsNullOrWhiteSpace($rateLiteral)) {
+                    if ($effectiveCapMode -eq 'throughput' -and -not [string]::IsNullOrWhiteSpace($rateLiteral)) {
                         $lines.Add("rate=$rateLiteral")
                     }
-                    if (-not [string]::IsNullOrWhiteSpace($rateIopsLiteral)) {
+                    if ($effectiveCapMode -eq 'iops' -and -not [string]::IsNullOrWhiteSpace($rateIopsLiteral)) {
                         $lines.Add("rate_iops=$rateIopsLiteral")
                     }
                     if ($Settings.Fsync -gt 0) {
