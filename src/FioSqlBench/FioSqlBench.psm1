@@ -3,6 +3,8 @@ $ErrorActionPreference = 'Stop'
 
 $script:FioDiagnosticsWindowMs = 1000
 $script:FioDiagnosticsStabilityWindowSamples = 5
+$script:FioDiagnosticsWarmupTrimSamples = 5
+$script:FioDiagnosticsSmoothingWindowSamples = 5
 $script:FioConvertFromJsonSupportsDepth = $null
 
 function ConvertFrom-FioJsonDocument {
@@ -1120,7 +1122,7 @@ function ConvertFrom-FioJsonToSummary {
 
     $read = Merge-FioOperationStats -Jobs $jobs -OperationName 'read'
     $write = Merge-FioOperationStats -Jobs $jobs -OperationName 'write'
-    $diagnostics = Get-FioDiagnosticsSummary -ResultDirectory $RunContext.ResultDirectory
+    $diagnostics = Get-FioDiagnosticsSummary -ResultDirectory $RunContext.ResultDirectory -WarmupTrimSamples $script:FioDiagnosticsWarmupTrimSamples -SmoothingWindowSamples $script:FioDiagnosticsSmoothingWindowSamples
 
     [pscustomobject]@{
         RunId = $RunContext.RunId
@@ -1258,6 +1260,87 @@ function New-FioDiagnosticsBandwidthStabilitySeries {
     }
 }
 
+function Get-FioDiagnosticsDisplayTransform {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Metric
+    )
+
+    switch ($Metric) {
+        'bandwidth' {
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = $script:FioDiagnosticsSmoothingWindowSamples }
+        }
+        'iops' {
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = $script:FioDiagnosticsSmoothingWindowSamples }
+        }
+        'latencyAvg' {
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3 }
+        }
+        'latencyMax' {
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3 }
+        }
+        'perfmonLatency' {
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3 }
+        }
+        default {
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 1 }
+        }
+    }
+}
+
+function Get-FioDiagnosticsSmoothedPoints {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Points,
+
+        [int]$TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples,
+
+        [int]$SmoothingWindowSize = 1
+    )
+
+    $orderedPoints = @($Points | Sort-Object TimeMs)
+    if ($orderedPoints.Count -eq 0) {
+        return @()
+    }
+
+    $effectiveTrim = [math]::Max(0, [math]::Min($TrimLeadingSamples, [math]::Max(0, $orderedPoints.Count - 1)))
+    $trimmedPoints = @($orderedPoints | Select-Object -Skip $effectiveTrim)
+    if ($trimmedPoints.Count -eq 0) {
+        $trimmedPoints = @($orderedPoints)
+    }
+
+    $effectiveWindow = [math]::Max(1, $SmoothingWindowSize)
+    if ($effectiveWindow -eq 1) {
+        return @(
+            foreach ($point in $trimmedPoints) {
+                [pscustomobject]@{
+                    TimeMs = [int]$point.TimeMs
+                    Value = [double]$point.Value
+                }
+            }
+        )
+    }
+
+    $smoothedPoints = New-Object System.Collections.Generic.List[object]
+    for ($index = 0; $index -lt $trimmedPoints.Count; $index++) {
+        $startIndex = [math]::Max(0, ($index - $effectiveWindow + 1))
+        $windowValues = @(
+            for ($windowIndex = $startIndex; $windowIndex -le $index; $windowIndex++) {
+                [double]$trimmedPoints[$windowIndex].Value
+            }
+        )
+
+        $smoothedPoints.Add([pscustomobject]@{
+            TimeMs = [int]$trimmedPoints[$index].TimeMs
+            Value = [double](($windowValues | Measure-Object -Average).Average)
+        })
+    }
+
+    return $smoothedPoints.ToArray()
+}
+
 function Get-FioBandwidthStabilityAssessment {
     [CmdletBinding()]
     param(
@@ -1271,14 +1354,14 @@ function Get-FioBandwidthStabilityAssessment {
         }
     }
 
-    if ($CvPercent -le 5) {
+    if ($CvPercent -le 12) {
         return [pscustomobject]@{
             Label = 'Stable'
             Class = 'stability-good'
         }
     }
 
-    if ($CvPercent -le 10) {
+    if ($CvPercent -le 25) {
         return [pscustomobject]@{
             Label = 'Moderate'
             Class = 'stability-warn'
@@ -1286,7 +1369,7 @@ function Get-FioBandwidthStabilityAssessment {
     }
 
     return [pscustomobject]@{
-        Label = 'Volatile'
+        Label = 'Bursty'
         Class = 'stability-bad'
     }
 }
@@ -1427,7 +1510,11 @@ function Get-FioDiagnosticsSummary {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$ResultDirectory
+        [string]$ResultDirectory,
+
+        [int]$WarmupTrimSamples = $script:FioDiagnosticsWarmupTrimSamples,
+
+        [int]$SmoothingWindowSamples = $script:FioDiagnosticsSmoothingWindowSamples
     )
 
     $raw = Get-FioDiagnosticsData -ResultDirectory $ResultDirectory
@@ -1438,6 +1525,8 @@ function Get-FioDiagnosticsSummary {
             Status = [string]$raw.Status
             Message = [string]$raw.Message
             LogWindowMs = $script:FioDiagnosticsWindowMs
+            WarmupTrimSamples = $WarmupTrimSamples
+            SmoothingWindowSamples = $SmoothingWindowSamples
             TimeRangeMs = $null
             MissingMetrics = @($raw.MissingMetrics)
             PresentMetrics = @($raw.PresentMetrics)
@@ -1481,6 +1570,8 @@ function Get-FioDiagnosticsSummary {
         Status = [string]$raw.Status
         Message = [string]$raw.Message
         LogWindowMs = $raw.LogWindowMs
+        WarmupTrimSamples = $WarmupTrimSamples
+        SmoothingWindowSamples = $SmoothingWindowSamples
         TimeRangeMs = $raw.TimeRangeMs
         MissingMetrics = @($raw.MissingMetrics)
         PresentMetrics = @($raw.PresentMetrics)
@@ -1651,7 +1742,7 @@ function Get-FioDiagnosticsData {
     $series = New-Object System.Collections.Generic.List[object]
     $allTimes = New-Object System.Collections.Generic.List[int]
     foreach ($entry in $seriesMap.GetEnumerator()) {
-        $points = @(
+        $rawPoints = @(
             foreach ($timeKey in ($entry.Value.PointsByTime.Keys | ForEach-Object { [int]$_ } | Sort-Object)) {
                 $allTimes.Add($timeKey)
                 [pscustomobject]@{
@@ -1661,6 +1752,8 @@ function Get-FioDiagnosticsData {
             }
         )
 
+        $displayTransform = Get-FioDiagnosticsDisplayTransform -Metric ([string]$entry.Value.Metric)
+        $points = @(Get-FioDiagnosticsSmoothedPoints -Points $rawPoints -TrimLeadingSamples $displayTransform.TrimLeadingSamples -SmoothingWindowSize $displayTransform.SmoothingWindowSize)
         $values = @($points | ForEach-Object { $_.Value })
         $series.Add([pscustomobject]@{
             Key = $entry.Value.Key
@@ -1676,6 +1769,9 @@ function Get-FioDiagnosticsData {
                 Avg = if ($values.Count -gt 0) { ($values | Measure-Object -Average).Average } else { 0 }
                 SampleCount = $values.Count
                 CvPercent = Get-FioCoefficientOfVariationFromValues -Values @($values | ForEach-Object { [double]$_ })
+                RawSampleCount = $rawPoints.Count
+                TrimmedSamples = [math]::Max(0, ($rawPoints.Count - $points.Count))
+                SmoothingWindowSamples = $displayTransform.SmoothingWindowSize
             }
         })
     }
@@ -1706,10 +1802,10 @@ function Get-FioDiagnosticsData {
     )
     $status = if ($missingMetrics.Count -gt 0) { 'Partial' } else { 'Available' }
     $message = if ($missingMetrics.Count -gt 0) {
-        'Some diagnostics were captured, but not every telemetry stream was available.'
+        'Some diagnostics were captured, but not every telemetry stream was available. Displayed charts use steady-state, smoothed samples.'
     }
     else {
-        'Windowed throughput, BW stability, IOPS, and latency diagnostics were captured successfully.'
+        'Windowed throughput, BW stability, IOPS, and latency diagnostics were captured successfully. Displayed charts use steady-state, smoothed samples.'
     }
 
     [pscustomobject]@{
@@ -3000,6 +3096,13 @@ function Get-FioHtmlSqlFitBlurb {
         $aggregateBandwidth = Get-FioAggregateBandwidthMBps -Run $Run
         $focusNote = ('Observed aggregate throughput is {0:N2} MB/s while SMB client counters show queueing or credit stalls. Treat this as saturation evidence before reading the run as an outright storage miss.' -f $aggregateBandwidth)
     }
+    elseif ($null -ne $throttlingModel -and $throttlingModel.Available -and -not $throttlingModel.Active -and [string]$Run.TargetType -eq 'Smb' -and @('MaxThroughput', 'MaxIOPs', 'BackupRestore', 'Tempdb', 'Data') -contains [string]$Run.Profile) {
+        $stabilityModels = @(Get-FioDiagnosticsBandwidthStabilityModels -Diagnostics $Run.Diagnostics)
+        $burstySeries = @($stabilityModels | Where-Object { $_.AssessmentLabel -eq 'Bursty' })
+        if ($burstySeries.Count -gt 0 -and $throttlingModel.QueueDepthMax -lt 4.0 -and $throttlingModel.ClientLatencyMaxMs -lt 20.0 -and $throttlingModel.CreditStallsMaxPerSec -le 0.0) {
+            $focusNote = 'Windowed fio delivery is bursty, but SMB client queue depth, client latency, and credit stalls stayed flat. Treat this as paced or burst-delivery behavior on the service path rather than clear client-side distress.'
+        }
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($targetText) -and -not [string]::IsNullOrWhiteSpace($focusNote)) {
         return ('{0} {1}' -f $targetText, $focusNote)
@@ -3504,6 +3607,8 @@ function New-FioHtmlDiagnosticsSection {
         $summaryItems = @(
                 [pscustomobject]@{ Label = 'Status'; Value = $state.Label },
                 [pscustomobject]@{ Label = 'Window'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['LogWindowMs']) { '{0} ms' -f $Diagnostics.LogWindowMs } else { '{0} ms' -f $script:FioDiagnosticsWindowMs } },
+            [pscustomobject]@{ Label = 'Warmup trim'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['WarmupTrimSamples']) { '{0} samples' -f $Diagnostics.WarmupTrimSamples } else { '{0} samples' -f $script:FioDiagnosticsWarmupTrimSamples } },
+            [pscustomobject]@{ Label = 'Smoothing'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['SmoothingWindowSamples']) { '{0}-sample moving avg' -f $Diagnostics.SmoothingWindowSamples } else { '{0}-sample moving avg' -f $script:FioDiagnosticsSmoothingWindowSamples } },
                 [pscustomobject]@{ Label = 'Duration'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['TimeRangeMs'] -and $null -ne $Diagnostics.TimeRangeMs) { '{0:N1} s' -f ($Diagnostics.TimeRangeMs / 1000.0) } else { '-' } },
                 [pscustomobject]@{ Label = 'Series'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['Series']) { [string](@($Diagnostics.Series).Count) } else { '0' } },
                 [pscustomobject]@{ Label = 'Source files'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['SourceFiles']) { [string](@($Diagnostics.SourceFiles).Count) } else { '0' } }
@@ -3550,10 +3655,10 @@ function New-FioHtmlDiagnosticsSection {
         $perfmonQueueSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonQueue' })
         $perfmonCreditStallSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonCreditStalls' })
         $cards = New-Object System.Collections.Generic.List[string]
-        $cards.Add((New-FioHtmlLineChartSection -Title 'Throughput Over Time' -Series $throughputSeries -Subtitle ('Windowed fio bandwidth logs sampled every {0} ms.' -f $Diagnostics.LogWindowMs)))
-        $cards.Add((New-FioHtmlLineChartSection -Title 'BW Stability Over Time' -Series $stabilitySeries -Subtitle ('Rolling {0}-sample coefficient of variation from fio bandwidth logs. Lower is steadier.' -f $script:FioDiagnosticsStabilityWindowSamples)))
-        $cards.Add((New-FioHtmlLineChartSection -Title 'IOPS Over Time' -Series $iopsSeries -Subtitle ('Windowed fio IOPS logs sampled every {0} ms.' -f $Diagnostics.LogWindowMs)))
-        $cards.Add((New-FioHtmlLineChartSection -Title 'Completion Latency Over Time' -Series $latencySeries -Subtitle ('Average and max completion latency from fio clat logs, useful for spotting stalls and throttling.' -f $Diagnostics.LogWindowMs)))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'Throughput Over Time' -Series $throughputSeries -Subtitle ('Steady-state fio bandwidth view sampled every {0} ms after trimming the first {1} samples and applying a moving average.' -f $Diagnostics.LogWindowMs, $(if ($Diagnostics.PSObject.Properties['WarmupTrimSamples']) { $Diagnostics.WarmupTrimSamples } else { $script:FioDiagnosticsWarmupTrimSamples }))))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'BW Stability Over Time' -Series $stabilitySeries -Subtitle ('Rolling {0}-sample coefficient of variation from the steady-state bandwidth view. Lower is steadier.' -f $script:FioDiagnosticsStabilityWindowSamples)))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'IOPS Over Time' -Series $iopsSeries -Subtitle ('Steady-state fio IOPS view sampled every {0} ms after trimming the first {1} samples and applying a moving average.' -f $Diagnostics.LogWindowMs, $(if ($Diagnostics.PSObject.Properties['WarmupTrimSamples']) { $Diagnostics.WarmupTrimSamples } else { $script:FioDiagnosticsWarmupTrimSamples }))))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'Completion Latency Over Time' -Series $latencySeries -Subtitle 'Steady-state completion latency view after warmup trimming and light smoothing, useful for spotting sustained stalls rather than one-window spikes.'))
         if ($perfmonLatencySeries.Count -gt 0) {
             $cards.Add((New-FioHtmlLineChartSection -Title 'SMB Client Latency Over Time' -Series $perfmonLatencySeries -Subtitle 'PerfMon SMB client read/write latency counters. This is client-observed SMB latency, useful for spotting queueing beyond storage-service latency.'))
         }
@@ -3650,11 +3755,11 @@ function Get-FioDiagnosticsChartModels {
     }
 
     $definitions = @(
-        [pscustomobject]@{ Key = 'bandwidth'; Title = 'Throughput Over Time'; Subtitle = 'Windowed fio bandwidth samples across the selected run.'; YAxisTitle = 'MB/s' }
-        [pscustomobject]@{ Key = 'bandwidthStability'; Title = 'BW Stability Over Time'; Subtitle = 'Rolling bandwidth coefficient of variation. Lower percentages indicate steadier delivery.'; YAxisTitle = 'CV %' }
-        [pscustomobject]@{ Key = 'iops'; Title = 'IOPS Over Time'; Subtitle = 'Windowed fio IOPS samples across the selected run.'; YAxisTitle = 'IOPS' }
-        [pscustomobject]@{ Key = 'latency'; Title = 'Completion Latency Over Time'; Subtitle = 'Average and max completion latency, useful for spotting stalls and throttling.'; YAxisTitle = 'Milliseconds' }
-        [pscustomobject]@{ Key = 'perfmonLatency'; Title = 'SMB Client Latency Over Time'; Subtitle = 'PerfMon SMB client read/write latency counters captured on the benchmark host.'; YAxisTitle = 'Milliseconds' }
+        [pscustomobject]@{ Key = 'bandwidth'; Title = 'Throughput Over Time'; Subtitle = 'Steady-state fio bandwidth samples across the selected run, after warmup trimming and moving-average smoothing.'; YAxisTitle = 'MB/s' }
+        [pscustomobject]@{ Key = 'bandwidthStability'; Title = 'BW Stability Over Time'; Subtitle = 'Rolling bandwidth coefficient of variation from the steady-state view. Lower percentages indicate steadier delivery.'; YAxisTitle = 'CV %' }
+        [pscustomobject]@{ Key = 'iops'; Title = 'IOPS Over Time'; Subtitle = 'Steady-state fio IOPS samples across the selected run, after warmup trimming and moving-average smoothing.'; YAxisTitle = 'IOPS' }
+        [pscustomobject]@{ Key = 'latency'; Title = 'Completion Latency Over Time'; Subtitle = 'Steady-state average and max completion latency, useful for spotting sustained stalls and throttling.'; YAxisTitle = 'Milliseconds' }
+        [pscustomobject]@{ Key = 'perfmonLatency'; Title = 'SMB Client Latency Over Time'; Subtitle = 'PerfMon SMB client read/write latency counters captured on the benchmark host, trimmed to the steady-state window.'; YAxisTitle = 'Milliseconds' }
         [pscustomobject]@{ Key = 'perfmonQueue'; Title = 'SMB Queue Over Time'; Subtitle = 'PerfMon SMB client queue depth. Sustained buildup usually means the path is saturated or being throttled.'; YAxisTitle = 'Queue depth' }
         [pscustomobject]@{ Key = 'perfmonCreditStalls'; Title = 'SMB Credit Stalls Over Time'; Subtitle = 'PerfMon SMB credit stalls per second. Non-zero values suggest client-side flow control while saturated.'; YAxisTitle = 'Stalls/sec' }
     )

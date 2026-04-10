@@ -683,8 +683,13 @@ function Enable-FioOptimizedSmbClientState {
         }
     }
 
-    if (@($initialSnapshot.MultichannelConnections | Where-Object { $null -eq $_.Selected -or [bool]$_.Selected }).Count -le 1) {
+    $selectedConnectionCount = @($initialSnapshot.MultichannelConnections | Where-Object { $null -eq $_.Selected -or [bool]$_.Selected }).Count
+    if ($selectedConnectionCount -le 1) {
         $messages.Add('One or fewer active SMB channels are currently visible. Existing SMB sessions may need to reconnect before new client settings change the channel count.')
+    }
+
+    if ($selectedConnectionCount -le 1 -and $initialSnapshot.ClientInterfaces.Count -eq 1 -and @($initialSnapshot.ClientInterfaces | Where-Object { [bool]$_.RssCapable }).Count -ge 1) {
+        $messages.Add('This client currently exposes one RSS-capable SMB interface to a single ANF storage endpoint. That does not automatically mean the SMB client is misconfigured; interpret channel count together with achieved throughput and client-side queue or latency growth.')
     }
 
     if ($initialSnapshot.RssAdapters.Count -eq 0) {
