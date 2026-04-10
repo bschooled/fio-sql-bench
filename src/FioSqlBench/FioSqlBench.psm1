@@ -349,11 +349,11 @@ function Get-FioSqlBenchProfileDefaults {
                 QueueDepth = 32
                 NumJobs = 4
                 BlockSize = '1m'
-                ReadMix = 50
+                ReadMix = $null
                 Fsync = 0
                 DirectLocal = 1
                 DirectSmb = 1
-                ReadWrite = 'rw'
+                ReadWrite = 'read+write'
             }
         }
         'MaxIOPs' {
@@ -760,11 +760,23 @@ function New-FioSqlBenchJobContent {
     }
 
     if ($Phase -in @('Bench', 'Combined')) {
-        if ($Settings.ProfileName -eq 'MaxIOPs') {
-            foreach ($operation in @(
-                @{ Label = 'read'; Rw = 'randread'; UseStonewall = $false },
-                @{ Label = 'write'; Rw = 'randwrite'; UseStonewall = $true }
-            )) {
+        if (@('MaxIOPs', 'MaxThroughput') -contains $Settings.ProfileName) {
+            $operations = switch ($Settings.ProfileName) {
+                'MaxIOPs' {
+                    @(
+                        @{ Label = 'read'; Rw = 'randread'; UseStonewall = $false },
+                        @{ Label = 'write'; Rw = 'randwrite'; UseStonewall = $true }
+                    )
+                }
+                'MaxThroughput' {
+                    @(
+                        @{ Label = 'read'; Rw = 'read'; UseStonewall = $false },
+                        @{ Label = 'write'; Rw = 'write'; UseStonewall = $true }
+                    )
+                }
+            }
+
+            foreach ($operation in $operations) {
                 for ($jobIndex = 1; $jobIndex -le $Settings.NumJobs; $jobIndex++) {
                     $filePath = ConvertTo-FioJobPath -Path (Join-Path -Path $RunContext.TargetRunDirectory -ChildPath ('testfile.{0:D2}.dat' -f $jobIndex))
 
@@ -2736,7 +2748,7 @@ function Get-FioHtmlSqlProfileAssessment {
                 elseif ($MeanLatencyMs -le 75) { $status = 'Watch' }
                 else { $status = 'Poor' }
 
-                $notes.Add('MaxThroughput intentionally uses large-block sequential I/O and enough concurrency to saturate the path. Throughput and stability matter more here than OLTP-style low latency.')
+                $notes.Add('MaxThroughput intentionally runs separate large-block sequential read and write phases with enough concurrency to saturate the path. Throughput and stability matter more here than OLTP-style low latency.')
             }
         }
         'Log' {
@@ -2936,10 +2948,10 @@ function Get-FioHtmlProfileTargetText {
         }
         'MaxThroughput' {
             if ($TargetType -eq 'Smb') {
-                return 'MaxThroughput is a best-case bandwidth profile. Favor stable large-block MB/s and avoid severe tail stalls while the SMB path is saturated.'
+                return 'MaxThroughput is a best-case bandwidth profile. It runs separate large-block sequential read and write phases so each direction can be compared against the SMB path limit.'
             }
 
-            return 'MaxThroughput is a best-case bandwidth profile. Favor stable large-block MB/s while accepting higher queueing latency than OLTP-style tests.'
+            return 'MaxThroughput is a best-case bandwidth profile. It runs separate large-block sequential read and write phases so each direction can be measured near the path limit.'
         }
         'BackupRestore' {
             if ($TargetType -eq 'Smb') {

@@ -49,7 +49,7 @@ The script looks for `fio.exe` in:
 | `Tempdb` | Approximates scratch-heavy tempdb activity. | `16 GB` | `rw=randrw`, `bs=8k`, `rwmixread=50`, `iodepth=32`, `numjobs=8` | Tuned to reduce the chance that results are dominated by cache residency. |
 | `BackupRestore` | Approximates large-block backup or restore transfer behavior. | `64 GB` | `rw=rw`, `bs=1m`, `rwmixread=50`, `iodepth=8`, `numjobs=2` | Uses a larger transfer size so sequential throughput is measured with a realistic working set. |
 | `DbccScan` | Approximates DBCC-style large-block scan reads. | `32 GB` | `rw=read`, `bs=256k`, `iodepth=8`, `numjobs=2` | Focused on large-block read scan behavior. |
-| `MaxThroughput` | Targets best-case path saturation for raw sequential transfer testing on local storage or SMB shares. | `64 GB` | `rw=rw`, `bs=1m`, `rwmixread=50`, `iodepth=32`, `numjobs=4` | Intentionally less SQL-like and tuned for peak sustained throughput. |
+| `MaxThroughput` | Targets best-case path saturation for raw sequential transfer testing on local storage or SMB shares. | `64 GB` | `bs=1m`, `iodepth=32`, `numjobs=4` | Runs two isolated phases against the same prepared files: sequential `read`, then sequential `write`, so each direction can be measured near the path limit. |
 | `MaxIOPs` | Targets best-case small-block random I/O saturation for peak read and write IOPS testing. | `32 GB` | `bs=4k`, `iodepth=64`, `numjobs=8` | Runs two isolated phases against the same prepared files: `randread`, then `randwrite`. |
 
 Batch profile behavior:

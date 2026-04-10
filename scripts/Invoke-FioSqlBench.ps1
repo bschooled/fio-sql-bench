@@ -23,8 +23,9 @@ for everything else.
  Built-in SQL-like fio template to start from. `Data` models random 8K mixed I/O,
  `Log` models sequential log writes, `Tempdb` models heavier scratch traffic,
  `BackupRestore` models large-block sequential transfer, `DbccScan` models
- large-block scan-heavy reads, `MaxThroughput` favors large-block sequential
- I/O with enough concurrency to chase the highest sustained path throughput,
+ large-block scan-heavy reads, `MaxThroughput` runs separate large-block
+ sequential read and write phases with enough concurrency to chase the highest
+ sustained path throughput in each direction,
  `MaxIOPs` favors small-block random I/O with aggressive concurrency and runs
  isolated `randread` and `randwrite` phases against the same prepared files to
  chase peak read and write IOPS separately, and `All` runs the built-in profile
@@ -76,6 +77,9 @@ program entries, and common Program Files locations.
 .PARAMETER EnableLogs
 Adds fio bandwidth, IOPS, and latency log files to the result set so diagnostics can chart throughput stability and transient stalls. On SMB targets, the runner also attempts to capture SMB client perf counters for queueing, credit stalls, and client-observed latency.
 
+.PARAMETER Optimized
+For SMB targets, captures the current SMB client configuration, previews or applies a benchmark-oriented SMB client tuning pass, and restores the original settings when the run finishes. If changes require elevation, the script relaunches itself in an elevated PowerShell session for the active run.
+
 .PARAMETER KeepJobFile
 Preserves the generated `.fio` job file in the results directory.
 
@@ -108,6 +112,9 @@ Shows the script help text without requiring any other parameters.
 
 .EXAMPLE
 ./scripts/Invoke-FioSqlBench.ps1 -TargetPath 'D:\SqlBench' -Profile MaxThroughput -DryRun
+
+.EXAMPLE
+./scripts/Invoke-FioSqlBench.ps1 -TargetPath '\\fileserver\sqlbench' -Profile MaxThroughput -Optimized
 
 .EXAMPLE
 ./scripts/Invoke-FioSqlBench.ps1 -TargetPath 'D:\SqlBench' -Profile MaxIOPs -DryRun
@@ -160,6 +167,8 @@ param(
     [string]$FioPath,
     [Parameter(ParameterSetName = 'Run')]
     [switch]$EnableLogs,
+    [Parameter(ParameterSetName = 'Run')]
+    [switch]$Optimized,
     [Parameter(ParameterSetName = 'Run')]
     [switch]$KeepJobFile,
     [Parameter(ParameterSetName = 'Run')]
@@ -375,6 +384,361 @@ function Stop-FioSmbPerfmonCapture {
     if (-not [string]::IsNullOrWhiteSpace([string]$Capture.StopPath) -and (Test-Path -LiteralPath $Capture.StopPath)) {
         Remove-Item -LiteralPath $Capture.StopPath -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Test-FioAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function ConvertTo-FioPowerShellArgumentLiteral {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return "''"
+    }
+
+    return ("'{0}'" -f ([string]$Value).Replace("'", "''"))
+}
+
+function Get-FioSelfRelaunchArgumentLine {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ScriptPath,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary]$BoundParameters
+    )
+
+    $arguments = New-Object System.Collections.Generic.List[string]
+    $arguments.Add('-NoProfile')
+    $arguments.Add('-ExecutionPolicy')
+    $arguments.Add('Bypass')
+    $arguments.Add('-File')
+    $arguments.Add((ConvertTo-FioPowerShellArgumentLiteral -Value $ScriptPath))
+
+    foreach ($entry in $BoundParameters.GetEnumerator()) {
+        if ($entry.Value -is [switch] -or $entry.Value -is [System.Management.Automation.SwitchParameter]) {
+            if ([bool]$entry.Value) {
+                $arguments.Add("-$($entry.Key)")
+            }
+
+            continue
+        }
+
+        $arguments.Add("-$($entry.Key)")
+        $arguments.Add((ConvertTo-FioPowerShellArgumentLiteral -Value $entry.Value))
+    }
+
+    return ($arguments -join ' ')
+}
+
+function Start-FioElevatedSelf {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ScriptPath,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary]$BoundParameters
+    )
+
+    $hostPath = (Get-Process -Id $PID).Path
+    $argumentLine = Get-FioSelfRelaunchArgumentLine -ScriptPath $ScriptPath -BoundParameters $BoundParameters
+
+    try {
+        $process = Start-Process -FilePath $hostPath -ArgumentList $argumentLine -Verb RunAs -Wait -PassThru -ErrorAction Stop
+    }
+    catch {
+        throw 'SMB optimization requires elevation and the elevated PowerShell process could not be started.'
+    }
+
+    if ($null -ne $process) {
+        exit $process.ExitCode
+    }
+
+    exit 0
+}
+
+function Get-FioSmbOptimizationSnapshot {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$TargetInfo
+    )
+
+    $targetRemoteRoot = "\\$($TargetInfo.SmbMetadata.ServerName)\$($TargetInfo.SmbMetadata.ShareName)"
+    $clientConfigRaw = Get-SmbClientConfiguration
+    $clientConfiguration = [pscustomobject]@{
+        EnableMultiChannel = [bool]$clientConfigRaw.EnableMultiChannel
+        EnableLargeMtu = [bool]$clientConfigRaw.EnableLargeMtu
+        ConnectionCountPerRssNetworkInterface = [int]$clientConfigRaw.ConnectionCountPerRssNetworkInterface
+        MaximumConnectionCountPerServer = [int]$clientConfigRaw.MaximumConnectionCountPerServer
+        EnableBandwidthThrottling = [bool]$clientConfigRaw.EnableBandwidthThrottling
+    }
+
+    $clientInterfaces = @()
+    try {
+        $clientInterfaces = @(
+            Get-SmbClientNetworkInterface -ErrorAction Stop |
+                Select-Object InterfaceIndex, InterfaceAlias, IpAddress, RssCapable, LinkSpeed
+        )
+    }
+    catch {
+        $clientInterfaces = @()
+    }
+
+    $multichannelConnections = @()
+    try {
+        $multichannelConnections = @(
+            Get-SmbMultichannelConnection -ErrorAction Stop |
+                Where-Object { $_.ServerName -eq $TargetInfo.SmbMetadata.ServerName } |
+                Select-Object ServerName, ClientIpAddress, ServerIpAddress, ClientInterfaceIndex, ServerInterfaceIndex, Selected, ClientRdmaCapable, ServerRdmaCapable
+        )
+    }
+    catch {
+        $multichannelConnections = @()
+    }
+
+    $mappings = @()
+    try {
+        $mappings = @(
+            Get-SmbMapping -ErrorAction Stop |
+                Where-Object {
+                    ([string]$_.RemotePath).TrimEnd('\\') -eq $targetRemoteRoot.TrimEnd('\\')
+                } |
+                Select-Object LocalPath, RemotePath, Status, UserName, Persistent
+        )
+    }
+    catch {
+        $mappings = @()
+    }
+
+    $rssAdapters = @()
+    try {
+        foreach ($adapter in @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface })) {
+            try {
+                $rss = Get-NetAdapterRss -Name $adapter.Name -ErrorAction Stop
+                if ($null -ne $rss) {
+                    $rssAdapters += [pscustomobject]@{
+                        Name = [string]$adapter.Name
+                        Enabled = [bool]$rss.Enabled
+                        NumberOfReceiveQueues = [int]$rss.NumberOfReceiveQueues
+                        Profile = [string]$rss.Profile
+                    }
+                }
+            }
+            catch {
+            }
+        }
+    }
+    catch {
+        $rssAdapters = @()
+    }
+
+    return [pscustomobject]@{
+        TimestampUtc = [DateTime]::UtcNow.ToString('o')
+        TargetRemoteRoot = $targetRemoteRoot
+        ClientConfiguration = $clientConfiguration
+        ClientInterfaces = $clientInterfaces
+        MultichannelConnections = $multichannelConnections
+        Mappings = $mappings
+        RssAdapters = $rssAdapters
+    }
+}
+
+function Export-FioSmbOptimizationState {
+    param(
+        [AllowNull()]
+        [pscustomobject]$State
+    )
+
+    if ($null -eq $State -or [string]::IsNullOrWhiteSpace([string]$State.ReportPath)) {
+        return
+    }
+
+    $reportDirectory = Split-Path -Path $State.ReportPath -Parent
+    if (-not [string]::IsNullOrWhiteSpace($reportDirectory) -and -not (Test-Path -LiteralPath $reportDirectory)) {
+        New-Item -ItemType Directory -Path $reportDirectory -Force | Out-Null
+    }
+
+    $State | ConvertTo-Json -Depth 12 | Set-Content -Path $State.ReportPath -Encoding utf8
+}
+
+function Write-FioSmbOptimizationSummary {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$State,
+
+        [string]$Title = 'SMB optimization state'
+    )
+
+    $status = if ($State.PreviewOnly -or $State.Applied -or @($State.Changes).Count -eq 0) { 'OK' } else { 'WARN' }
+    Write-FioStage -Title $Title -Status $status
+    Write-FioProperty -Name 'Remote share' -Value $State.TargetRemoteRoot
+    Write-FioProperty -Name 'Preview only' -Value $(if ($State.PreviewOnly) { 'Yes' } else { 'No' })
+    Write-FioProperty -Name 'Applied' -Value $(if ($State.Applied) { 'Yes' } else { 'No' })
+    Write-FioProperty -Name 'Report path' -Value $State.ReportPath
+    Write-FioProperty -Name 'Initial channels' -Value @($State.Initial.MultichannelConnections | Where-Object { $null -eq $_.Selected -or [bool]$_.Selected }).Count
+    if ($null -ne $State.Final) {
+        Write-FioProperty -Name 'Current channels' -Value @($State.Final.MultichannelConnections | Where-Object { $null -eq $_.Selected -or [bool]$_.Selected }).Count
+    }
+
+    foreach ($change in @($State.Changes)) {
+        Write-Host ("  - {0}" -f $change) -ForegroundColor DarkGray
+    }
+
+    foreach ($note in @($State.Messages)) {
+        Write-Host ("  - {0}" -f $note) -ForegroundColor Yellow
+    }
+}
+
+function Enable-FioOptimizedSmbClientState {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$TargetInfo,
+
+        [Parameter(Mandatory)]
+        [string]$ResultDirectory,
+
+        [switch]$DryRun
+    )
+
+    if ($TargetInfo.Type -ne 'Smb' -or $null -eq $TargetInfo.SmbMetadata) {
+        throw '-Optimized is only supported for SMB targets.'
+    }
+
+    $reportPath = Join-Path -Path $ResultDirectory -ChildPath 'smb-optimization.json'
+    $initialSnapshot = Get-FioSmbOptimizationSnapshot -TargetInfo $TargetInfo
+    $changes = New-Object System.Collections.Generic.List[string]
+    $messages = New-Object System.Collections.Generic.List[string]
+    $changedRssAdapters = New-Object System.Collections.Generic.List[string]
+
+    $state = [pscustomobject]@{
+        Enabled = $true
+        PreviewOnly = [bool]$DryRun
+        Applied = $false
+        TargetRemoteRoot = $initialSnapshot.TargetRemoteRoot
+        ReportPath = $reportPath
+        TargetInfo = [pscustomobject]@{
+            Type = 'Smb'
+            SmbMetadata = [pscustomobject]@{
+                ServerName = $TargetInfo.SmbMetadata.ServerName
+                ShareName = $TargetInfo.SmbMetadata.ShareName
+            }
+        }
+        Initial = $initialSnapshot
+        Final = $null
+        Restored = $null
+        Changes = $changes
+        Messages = $messages
+        ChangedRssAdapters = $changedRssAdapters
+    }
+
+    $desiredConnectionCount = [int][math]::Max($initialSnapshot.ClientConfiguration.ConnectionCountPerRssNetworkInterface, 4)
+    $desiredServerConnectionCount = [int][math]::Max($initialSnapshot.ClientConfiguration.MaximumConnectionCountPerServer, 32)
+
+    if (-not $initialSnapshot.ClientConfiguration.EnableMultiChannel) {
+        $changes.Add('Enable SMB Multichannel.')
+        if (-not $DryRun) {
+            Set-SmbClientConfiguration -EnableMultiChannel $true -Force -Confirm:$false | Out-Null
+            $state.Applied = $true
+        }
+    }
+
+    if (-not $initialSnapshot.ClientConfiguration.EnableLargeMtu) {
+        $changes.Add('Enable SMB Large MTU.')
+        if (-not $DryRun) {
+            Set-SmbClientConfiguration -EnableLargeMtu $true -Force -Confirm:$false | Out-Null
+            $state.Applied = $true
+        }
+    }
+
+    if ($initialSnapshot.ClientConfiguration.ConnectionCountPerRssNetworkInterface -lt $desiredConnectionCount) {
+        $changes.Add(('Increase ConnectionCountPerRssNetworkInterface from {0} to {1}.' -f $initialSnapshot.ClientConfiguration.ConnectionCountPerRssNetworkInterface, $desiredConnectionCount))
+        if (-not $DryRun) {
+            Set-SmbClientConfiguration -ConnectionCountPerRssNetworkInterface $desiredConnectionCount -Force -Confirm:$false | Out-Null
+            $state.Applied = $true
+        }
+    }
+
+    if ($initialSnapshot.ClientConfiguration.MaximumConnectionCountPerServer -lt $desiredServerConnectionCount) {
+        $changes.Add(('Increase MaximumConnectionCountPerServer from {0} to {1}.' -f $initialSnapshot.ClientConfiguration.MaximumConnectionCountPerServer, $desiredServerConnectionCount))
+        if (-not $DryRun) {
+            Set-SmbClientConfiguration -MaximumConnectionCountPerServer $desiredServerConnectionCount -Force -Confirm:$false | Out-Null
+            $state.Applied = $true
+        }
+    }
+
+    foreach ($rssAdapter in @($initialSnapshot.RssAdapters)) {
+        if (-not [bool]$rssAdapter.Enabled) {
+            $changes.Add(('Enable RSS on adapter {0}.' -f $rssAdapter.Name))
+            if (-not $DryRun) {
+                Enable-NetAdapterRss -Name $rssAdapter.Name -Confirm:$false -ErrorAction Stop | Out-Null
+                $changedRssAdapters.Add([string]$rssAdapter.Name)
+                $state.Applied = $true
+            }
+        }
+    }
+
+    if (@($initialSnapshot.MultichannelConnections | Where-Object { $null -eq $_.Selected -or [bool]$_.Selected }).Count -le 1) {
+        $messages.Add('One or fewer active SMB channels are currently visible. Existing SMB sessions may need to reconnect before new client settings change the channel count.')
+    }
+
+    if ($initialSnapshot.RssAdapters.Count -eq 0) {
+        $messages.Add('No up hardware adapters with queryable RSS state were found. The optimization pass can still adjust SMB client settings, but multichannel scaling may remain limited by the network path.')
+    }
+
+    if ($changes.Count -eq 0) {
+        $messages.Add('The current SMB client settings already meet the built-in optimization baseline.')
+    }
+
+    if ($DryRun) {
+        Export-FioSmbOptimizationState -State $state
+        return $state
+    }
+
+    $state.Final = Get-FioSmbOptimizationSnapshot -TargetInfo $TargetInfo
+    Export-FioSmbOptimizationState -State $state
+    return $state
+}
+
+function Restore-FioOptimizedSmbClientState {
+    param(
+        [AllowNull()]
+        [pscustomobject]$State
+    )
+
+    if ($null -eq $State -or $State.PreviewOnly -or $null -eq $State.Initial) {
+        return
+    }
+
+    try {
+        Set-SmbClientConfiguration `
+            -EnableMultiChannel ([bool]$State.Initial.ClientConfiguration.EnableMultiChannel) `
+            -EnableLargeMtu ([bool]$State.Initial.ClientConfiguration.EnableLargeMtu) `
+            -ConnectionCountPerRssNetworkInterface ([int]$State.Initial.ClientConfiguration.ConnectionCountPerRssNetworkInterface) `
+            -MaximumConnectionCountPerServer ([int]$State.Initial.ClientConfiguration.MaximumConnectionCountPerServer) `
+            -Force `
+            -Confirm:$false | Out-Null
+    }
+    catch {
+        $State.Messages.Add('Failed to restore the original SMB client configuration automatically. Review smb-optimization.json for the captured baseline.')
+    }
+
+    foreach ($adapterName in @($State.ChangedRssAdapters)) {
+        try {
+            Disable-NetAdapterRss -Name $adapterName -Confirm:$false -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $State.Messages.Add(('Failed to disable RSS again on adapter {0}. Review the captured optimization state.' -f $adapterName))
+        }
+    }
+
+    $State.Restored = Get-FioSmbOptimizationSnapshot -TargetInfo $State.TargetInfo
+    Export-FioSmbOptimizationState -State $State
 }
 
 function Write-FioStage {
@@ -699,7 +1063,7 @@ function Get-FioSqlProfileAssessment {
                 elseif ($MeanLatencyMs -le 75) { $status = 'Watch' }
                 else { $status = 'Poor' }
 
-                $notes.Add('MaxThroughput intentionally uses large-block sequential I/O and enough concurrency to saturate the path. Throughput and stability matter more here than OLTP-style low latency.')
+                $notes.Add('MaxThroughput intentionally runs separate large-block sequential read and write phases with enough concurrency to saturate the path. Throughput and stability matter more here than OLTP-style low latency.')
             }
         }
         'Log' {
@@ -888,10 +1252,10 @@ function Write-FioSqlInterpretation {
         }
         'MaxThroughput' {
             if ($TargetType -eq 'Smb') {
-                Write-FioProperty -Name 'Profile target' -Value 'MaxThroughput is a best-case bandwidth profile. Favor stable large-block MB/s and avoid severe tail stalls while the SMB path is saturated.'
+                Write-FioProperty -Name 'Profile target' -Value 'MaxThroughput is a best-case bandwidth profile. It runs separate large-block sequential read and write phases so each direction can be compared against the SMB path limit.'
             }
             else {
-                Write-FioProperty -Name 'Profile target' -Value 'MaxThroughput is a best-case bandwidth profile. Favor stable large-block MB/s while accepting higher queueing latency than OLTP-style tests.'
+                Write-FioProperty -Name 'Profile target' -Value 'MaxThroughput is a best-case bandwidth profile. It runs separate large-block sequential read and write phases so each direction can be measured near the path limit.'
             }
         }
         'BackupRestore' {
@@ -1474,6 +1838,10 @@ if ($Help) {
 
 $resolvedTarget = Resolve-FioSqlBenchTarget -TargetPath $TargetPath -TargetType $TargetType
 
+if ($Optimized -and $resolvedTarget.Type -ne 'Smb') {
+    throw '-Optimized is only supported for SMB targets.'
+}
+
 if ($Profile -eq 'All') {
     $allPlan = Get-FioAllProfilePlan `
         -TargetInfo $resolvedTarget `
@@ -1503,6 +1871,12 @@ if ($Profile -eq 'All') {
     Write-FioProperty -Name 'Batch results' -Value $allResultRoot
     Write-FioAllProfilePlan -Plan $allPlan
 
+    $allOptimizationPreview = $null
+    if ($Optimized) {
+        $allOptimizationPreview = Enable-FioOptimizedSmbClientState -TargetInfo $resolvedTarget -ResultDirectory $allResultRoot -DryRun
+        Write-FioSmbOptimizationSummary -State $allOptimizationPreview -Title 'SMB optimization preview'
+    }
+
     if ($DryRun) {
         Write-FioStage -Title 'Dry run complete: built all-profile execution plan without executing I/O' -Status 'OK'
         $dryRunResult = [pscustomobject]@{
@@ -1513,6 +1887,7 @@ if ($Profile -eq 'All') {
             TargetPath = $resolvedTarget.Path
             ResultDirectory = $allResultRoot
             Plan = $allPlan
+            OptimizationPreview = $allOptimizationPreview
         }
         if ($PassThru) {
             $dryRunResult
@@ -1520,74 +1895,93 @@ if ($Profile -eq 'All') {
         return
     }
 
+    if ($Optimized -and -not (Test-FioAdministrator)) {
+        Write-FioStage -Title 'Elevation required for SMB optimization' -Status 'RUN'
+        Write-FioProperty -Name 'Reason' -Value 'Applying SMB client tuning and adapter RSS changes requires an elevated PowerShell session.'
+        Start-FioElevatedSelf -ScriptPath $MyInvocation.MyCommand.Path -BoundParameters $PSBoundParameters
+        return
+    }
+
     New-Item -ItemType Directory -Path $allResultRoot -Force | Out-Null
 
     $childResults = New-Object System.Collections.Generic.List[object]
     $usedCacheGroups = New-Object System.Collections.Generic.HashSet[string]
-
-    foreach ($planItem in $allPlan) {
-        Write-FioStage -Title ("Starting child profile {0}" -f $planItem.Profile) -Status 'RUN'
-
-        $invokeParams = @{
-            TargetPath = $TargetPath
-            TargetType = $TargetType
-            Profile = $planItem.Profile
-            OutputRoot = $allResultRoot
-            EnableLogs = $EnableLogs
-            KeepJobFile = $KeepJobFile
-            NoCleanup = $NoCleanup
-            PassThru = $true
-        }
-
-        if ($PSBoundParameters.ContainsKey('FioPath')) {
-            $invokeParams.FioPath = $FioPath
-        }
-
-        foreach ($name in 'FileSizeGB', 'RuntimeSec', 'RampSec', 'Iterations', 'QueueDepth', 'NumJobs', 'BlockSize', 'ReadMix', 'Fsync', 'Direct') {
-            if ($PSBoundParameters.ContainsKey($name)) {
-                $invokeParams[$name] = $PSBoundParameters[$name]
-            }
-        }
-
-        if ($planItem.PreparationRequired) {
-            $invokeParams.ReusePreparedFiles = $true
-            $invokeParams.PreparationCacheGroup = $planItem.PreparationCacheGroup
-            [void]$usedCacheGroups.Add([string]$planItem.PreparationCacheGroup)
-        }
-
-        $childResult = & $MyInvocation.MyCommand.Path @invokeParams
-        if ($null -ne $childResult) {
-            $childResults.Add($childResult)
-        }
-    }
-
     $historicalJsonPath = Join-Path -Path $allResultRoot -ChildPath 'historical-summary.json'
     $historicalCsvPath = Join-Path -Path $allResultRoot -ChildPath 'historical-summary.csv'
     $historicalHtmlPath = Join-Path -Path $allResultRoot -ChildPath 'historical-report.html'
-    $historicalRuns = Import-FioSqlBenchHistory -ResultsRoot $allResultRoot
-    $historicalRollups = Get-FioHistoricalRollup -Runs $historicalRuns
+    $batchOptimizationState = $null
+    try {
+        if ($Optimized) {
+            $batchOptimizationState = Enable-FioOptimizedSmbClientState -TargetInfo $resolvedTarget -ResultDirectory $allResultRoot
+            Write-FioSmbOptimizationSummary -State $batchOptimizationState -Title 'Applied SMB optimization'
+        }
 
-    [pscustomobject]@{
-        GeneratedUtc = [DateTime]::UtcNow.ToString('o')
-        ResultsRoot = $allResultRoot
-        ProfileFilter = 'Any'
-        TargetTypeFilter = 'Any'
-        TargetPathLike = $null
-        Newest = $null
-        RunCount = $historicalRuns.Count
-        RollupCount = $historicalRollups.Count
-        Runs = $historicalRuns
-        Rollups = $historicalRollups
-    } | ConvertTo-Json -Depth 12 | Set-Content -Path $historicalJsonPath -Encoding utf8
+        foreach ($planItem in $allPlan) {
+            Write-FioStage -Title ("Starting child profile {0}" -f $planItem.Profile) -Status 'RUN'
 
-    Export-FioSqlBenchHistoricalCsv -Runs $historicalRuns -Path $historicalCsvPath
-    Export-FioSqlBenchHtmlReport -Runs $historicalRuns -Rollups $historicalRollups -Path $historicalHtmlPath -Title ("fio SQL Bench All Profile Report - {0}" -f $allRunId) -ResultsRoot $allResultRoot
+            $invokeParams = @{
+                TargetPath = $TargetPath
+                TargetType = $TargetType
+                Profile = $planItem.Profile
+                OutputRoot = $allResultRoot
+                EnableLogs = $EnableLogs
+                KeepJobFile = $KeepJobFile
+                NoCleanup = $NoCleanup
+                PassThru = $true
+            }
 
-    if (-not $ReusePreparedFiles) {
-        foreach ($cacheGroup in $usedCacheGroups) {
-            $cachePath = Join-Path -Path $resolvedTarget.Path -ChildPath (Join-Path -Path '.fio-sql-bench-cache' -ChildPath $cacheGroup)
-            if (Test-Path -LiteralPath $cachePath) {
-                Remove-Item -LiteralPath $cachePath -Recurse -Force
+            if ($PSBoundParameters.ContainsKey('FioPath')) {
+                $invokeParams.FioPath = $FioPath
+            }
+
+            foreach ($name in 'FileSizeGB', 'RuntimeSec', 'RampSec', 'Iterations', 'QueueDepth', 'NumJobs', 'BlockSize', 'ReadMix', 'Fsync', 'Direct') {
+                if ($PSBoundParameters.ContainsKey($name)) {
+                    $invokeParams[$name] = $PSBoundParameters[$name]
+                }
+            }
+
+            if ($planItem.PreparationRequired) {
+                $invokeParams.ReusePreparedFiles = $true
+                $invokeParams.PreparationCacheGroup = $planItem.PreparationCacheGroup
+                [void]$usedCacheGroups.Add([string]$planItem.PreparationCacheGroup)
+            }
+
+            $childResult = & $MyInvocation.MyCommand.Path @invokeParams
+            if ($null -ne $childResult) {
+                $childResults.Add($childResult)
+            }
+        }
+
+        $historicalRuns = Import-FioSqlBenchHistory -ResultsRoot $allResultRoot
+        $historicalRollups = Get-FioHistoricalRollup -Runs $historicalRuns
+
+        [pscustomobject]@{
+            GeneratedUtc = [DateTime]::UtcNow.ToString('o')
+            ResultsRoot = $allResultRoot
+            ProfileFilter = 'Any'
+            TargetTypeFilter = 'Any'
+            TargetPathLike = $null
+            Newest = $null
+            RunCount = $historicalRuns.Count
+            RollupCount = $historicalRollups.Count
+            Runs = $historicalRuns
+            Rollups = $historicalRollups
+        } | ConvertTo-Json -Depth 12 | Set-Content -Path $historicalJsonPath -Encoding utf8
+
+        Export-FioSqlBenchHistoricalCsv -Runs $historicalRuns -Path $historicalCsvPath
+        Export-FioSqlBenchHtmlReport -Runs $historicalRuns -Rollups $historicalRollups -Path $historicalHtmlPath -Title ("fio SQL Bench All Profile Report - {0}" -f $allRunId) -ResultsRoot $allResultRoot
+    }
+    finally {
+        if ($Optimized) {
+            Restore-FioOptimizedSmbClientState -State $batchOptimizationState
+        }
+
+        if (-not $ReusePreparedFiles) {
+            foreach ($cacheGroup in $usedCacheGroups) {
+                $cachePath = Join-Path -Path $resolvedTarget.Path -ChildPath (Join-Path -Path '.fio-sql-bench-cache' -ChildPath $cacheGroup)
+                if (Test-Path -LiteralPath $cachePath) {
+                    Remove-Item -LiteralPath $cachePath -Recurse -Force
+                }
             }
         }
     }
@@ -1609,6 +2003,7 @@ if ($Profile -eq 'All') {
             HistoricalJsonPath = $historicalJsonPath
             HistoricalCsvPath = $historicalCsvPath
             HistoricalHtmlPath = $historicalHtmlPath
+            Optimization = $batchOptimizationState
         }
     }
 
@@ -1673,6 +2068,12 @@ Write-FioStage -Title 'Resolved benchmark plan' -Status 'OK'
 Write-FioSettingsBlock -TargetInfo $resolvedTarget -Settings $effectiveSettings -RunContext $runContext -WorkloadProfile $resolvedWorkloadProfile
 Write-FioCacheAssessment -Assessment $cacheAssessment
 
+$optimizationPreview = $null
+if ($Optimized) {
+    $optimizationPreview = Enable-FioOptimizedSmbClientState -TargetInfo $resolvedTarget -ResultDirectory $runContext.ResultDirectory -DryRun
+    Write-FioSmbOptimizationSummary -State $optimizationPreview -Title 'SMB optimization preview'
+}
+
 if ($resolvedTarget.CreatedDirectory) {
     Write-FioStage -Title 'Created target directory for benchmark files' -Status 'OK'
     Write-FioProperty -Name 'Created path' -Value $resolvedTarget.Path
@@ -1708,10 +2109,18 @@ if ($DryRun) {
         EffectiveSettings = $effectiveSettings
         PrepJobPreview = $prepJobContent
         JobPreview = $jobContent
+        OptimizationPreview = $optimizationPreview
     }
     if ($PassThru) {
         $dryRunResult
     }
+    return
+}
+
+if ($Optimized -and -not (Test-FioAdministrator)) {
+    Write-FioStage -Title 'Elevation required for SMB optimization' -Status 'RUN'
+    Write-FioProperty -Name 'Reason' -Value 'Applying SMB client tuning and adapter RSS changes requires an elevated PowerShell session.'
+    Start-FioElevatedSelf -ScriptPath $MyInvocation.MyCommand.Path -BoundParameters $PSBoundParameters
     return
 }
 
@@ -1746,10 +2155,16 @@ $iterationSummaries = New-Object System.Collections.Generic.List[object]
 $runSucceeded = $false
 $preparedFiles = Get-FioBenchFilePaths -Settings $effectiveSettings -RunContext $executionRunContext
 $prepRequired = Test-FioPreparationRequired -Settings $effectiveSettings
+$optimizationState = $null
 
 try {
     if (-not $PSCmdlet.ShouldProcess($executionRunContext.TargetRunDirectory, "Run fio profile $resolvedWorkloadProfile")) {
         return
+    }
+
+    if ($Optimized) {
+        $optimizationState = Enable-FioOptimizedSmbClientState -TargetInfo $resolvedTarget -ResultDirectory $runContext.ResultDirectory
+        Write-FioSmbOptimizationSummary -State $optimizationState -Title 'Applied SMB optimization'
     }
 
     if (-not $prepRequired) {
@@ -1860,6 +2275,10 @@ try {
     $runSucceeded = $true
 }
 finally {
+    if ($Optimized) {
+        Restore-FioOptimizedSmbClientState -State $optimizationState
+    }
+
     if (-not $KeepJobFile -and $runSucceeded -and (Test-Path -Path $prepJobFilePath)) {
         Remove-Item -Path $prepJobFilePath -Force
     }
@@ -1889,6 +2308,7 @@ $aggregate = [pscustomobject]@{
     ResultDirectory = $runContext.ResultDirectory
     DiagnosticsEnabled = [bool]$EnableLogs
     CpuAffinity = Get-FioCpuAffinitySummary -Settings $effectiveSettings
+    Optimization = $optimizationState
     Iterations = $iterationSummaries
 }
 
