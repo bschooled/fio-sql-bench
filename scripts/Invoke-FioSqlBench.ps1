@@ -59,6 +59,12 @@ Read percentage for mixed workloads (`rwmixread`). Ignored for pure write tests.
 .PARAMETER Fsync
 fio `fsync` frequency. The `Log` profile defaults to `1`.
 
+.PARAMETER ThroughputCapMBps
+Optional aggregate throughput cap in MB/s. The runner converts this into per-job fio `rate` pacing so the workload does not intentionally exceed the requested sustained bandwidth.
+
+.PARAMETER IopsCap
+Optional aggregate IOPS cap. The runner converts this into per-job fio `rate_iops` pacing so the workload does not intentionally exceed the requested sustained IOPS.
+
 .PARAMETER Direct
 Controls buffered vs direct I/O. `Auto` defaults to direct I/O for both local
 and SMB targets in the built-in profiles so client-side caching is reduced by
@@ -114,6 +120,12 @@ Shows the script help text without requiring any other parameters.
 ./scripts/Invoke-FioSqlBench.ps1 -TargetPath 'D:\SqlBench' -Profile MaxThroughput -DryRun
 
 .EXAMPLE
+./scripts/Invoke-FioSqlBench.ps1 -TargetPath '\\fileserver\sqlbench' -Profile MaxThroughput -ThroughputCapMBps 250
+
+.EXAMPLE
+./scripts/Invoke-FioSqlBench.ps1 -TargetPath 'D:\SqlBench' -Profile Data -IopsCap 30000
+
+.EXAMPLE
 ./scripts/Invoke-FioSqlBench.ps1 -TargetPath '\\fileserver\sqlbench' -Profile MaxThroughput -Optimized
 
 .EXAMPLE
@@ -154,6 +166,12 @@ param(
     [Nullable[int]]$ReadMix,
     [Parameter(ParameterSetName = 'Run')]
     [Nullable[int]]$Fsync,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [Nullable[decimal]]$ThroughputCapMBps,
+
+    [Parameter(ParameterSetName = 'Run')]
+    [Nullable[int]]$IopsCap,
 
     [Parameter(ParameterSetName = 'Run')]
     [ValidateSet('Auto', 'On', 'Off')]
@@ -1633,6 +1651,12 @@ function Write-FioSettingsBlock {
     if ($Settings.Fsync -gt 0) {
         Write-FioProperty -Name 'fsync' -Value $Settings.Fsync
     }
+    if ($null -ne $Settings.ThroughputCapMBps) {
+        Write-FioProperty -Name 'Throughput cap' -Value ('{0:N2} MB/s' -f [decimal]$Settings.ThroughputCapMBps)
+    }
+    if ($null -ne $Settings.IopsCap) {
+        Write-FioProperty -Name 'IOPS cap' -Value ('{0:N0}' -f [int]$Settings.IopsCap)
+    }
 }
 
 function Write-FioIterationSummary {
@@ -1729,6 +1753,8 @@ function Get-FioAllProfilePlan {
         [string]$BlockSize,
         [Nullable[int]]$ReadMix,
         [Nullable[int]]$Fsync,
+        [Nullable[decimal]]$ThroughputCapMBps,
+        [Nullable[int]]$IopsCap,
         [string]$Direct
     )
 
@@ -1751,6 +1777,8 @@ function Get-FioAllProfilePlan {
             -BlockSize $BlockSize `
             -ReadMix $ReadMix `
             -Fsync $Fsync `
+            -ThroughputCapMBps $ThroughputCapMBps `
+            -IopsCap $IopsCap `
             -Direct $Direct
 
         $prepRequired = Test-FioPreparationRequired -Settings $settings
@@ -1811,6 +1839,8 @@ function Write-FioAllProfilePlan {
 
     foreach ($item in $Plan) {
         $prepMode = if (-not $item.PreparationRequired) { 'No prep' } elseif ($item.IsPreparationLeader) { 'Prep leader' } else { 'Reuse prep' }
+        [Nullable[decimal]]$ThroughputCapMBps,
+        [Nullable[int]]$IopsCap,
         $fileSizePerJobGb = [math]::Round(($item.Settings.FileSizePerJobBytes / 1GB), 2)
         $reuseSource = if (-not $item.PreparationRequired) { '-' } elseif ($item.IsPreparationLeader) { [string]$item.PreparationCacheGroup } else { '{0} via {1}' -f $item.PreparationLeaderProfile, $item.PreparationCacheGroup }
         Write-Host ('  {0,-15} {1,-12} {2,8} {3,14:N2} {4,-18}' -f $item.Profile, $prepMode, $item.Settings.NumJobs, $fileSizePerJobGb, $reuseSource) -ForegroundColor Gray
@@ -1859,6 +1889,10 @@ if ($Profile -eq 'All') {
         -BlockSize $BlockSize `
         -ReadMix $ReadMix `
         -Fsync $Fsync `
+            -ThroughputCapMBps $ThroughputCapMBps `
+            -IopsCap $IopsCap `
+        -ThroughputCapMBps $ThroughputCapMBps `
+        -IopsCap $IopsCap `
         -Direct $Direct
 
     $allTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1939,7 +1973,7 @@ if ($Profile -eq 'All') {
                 $invokeParams.FioPath = $FioPath
             }
 
-            foreach ($name in 'FileSizeGB', 'RuntimeSec', 'RampSec', 'Iterations', 'QueueDepth', 'NumJobs', 'BlockSize', 'ReadMix', 'Fsync', 'Direct') {
+            foreach ($name in 'FileSizeGB', 'RuntimeSec', 'RampSec', 'Iterations', 'QueueDepth', 'NumJobs', 'BlockSize', 'ReadMix', 'Fsync', 'ThroughputCapMBps', 'IopsCap', 'Direct') {
                 if ($PSBoundParameters.ContainsKey($name)) {
                     $invokeParams[$name] = $PSBoundParameters[$name]
                 }
@@ -2030,6 +2064,8 @@ $effectiveSettings = Merge-FioSqlBenchSettings `
     -BlockSize $BlockSize `
     -ReadMix $ReadMix `
     -Fsync $Fsync `
+    -ThroughputCapMBps $ThroughputCapMBps `
+    -IopsCap $IopsCap `
     -Direct $Direct
 
 $runContext = New-FioSqlBenchRunContext `

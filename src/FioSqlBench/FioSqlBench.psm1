@@ -5,6 +5,8 @@ $script:FioDiagnosticsWindowMs = 1000
 $script:FioDiagnosticsStabilityWindowSamples = 5
 $script:FioDiagnosticsWarmupTrimSamples = 5
 $script:FioDiagnosticsSmoothingWindowSamples = 5
+$script:FioDiagnosticsCapPercentile = 95
+$script:FioDiagnosticsCapMinimumSamples = 6
 $script:FioConvertFromJsonSupportsDepth = $null
 
 function ConvertFrom-FioJsonDocument {
@@ -402,6 +404,8 @@ function Merge-FioSqlBenchSettings {
         [string]$BlockSize,
         [Nullable[int]]$ReadMix,
         [Nullable[int]]$Fsync,
+        [Nullable[decimal]]$ThroughputCapMBps,
+        [Nullable[int]]$IopsCap,
 
         [ValidateSet('Auto', 'On', 'Off')]
         [string]$Direct = 'Auto'
@@ -418,6 +422,8 @@ function Merge-FioSqlBenchSettings {
         BlockSize = if ($BlockSize) { $BlockSize } else { [string]$ProfileDefaults.BlockSize }
         ReadMix = if ($null -ne $ReadMix) { [int]$ReadMix } else { $ProfileDefaults.ReadMix }
         Fsync = if ($null -ne $Fsync) { [int]$Fsync } else { [int]$ProfileDefaults.Fsync }
+        ThroughputCapMBps = if ($null -ne $ThroughputCapMBps) { [decimal]$ThroughputCapMBps } else { $null }
+        IopsCap = if ($null -ne $IopsCap) { [int]$IopsCap } else { $null }
         ReadWrite = [string]$ProfileDefaults.ReadWrite
     }
 
@@ -445,6 +451,14 @@ function Merge-FioSqlBenchSettings {
         throw 'ReadMix must be between 0 and 100.'
     }
 
+    if ($null -ne $settings.ThroughputCapMBps -and [decimal]$settings.ThroughputCapMBps -le 0) {
+        throw 'ThroughputCapMBps must be greater than 0.'
+    }
+
+    if ($null -ne $settings.IopsCap -and [int]$settings.IopsCap -le 0) {
+        throw 'IopsCap must be greater than 0.'
+    }
+
     $blockSizeBytes = ConvertFrom-FioSizeStringToBytes -Size $settings.BlockSize
     $totalFileBytes = [int64][math]::Floor([decimal]1GB * $settings.FileSizeGB)
     if ($null -ne $TargetInfo.FreeSpaceBytes) {
@@ -465,6 +479,79 @@ function Merge-FioSqlBenchSettings {
     $settings.FileSizePerJobBytes = Get-FioAlignedByteCount -ByteCount $perJobBytes -Alignment $blockSizeBytes
     $settings.CpuAffinity = Get-FioCpuAffinityPlan -Settings ([pscustomobject]$settings)
     [pscustomobject]$settings
+}
+
+function Get-FioPerJobCapShare {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [double]$TotalCap,
+
+        [Parameter(Mandatory)]
+        [int]$NumJobs
+    )
+
+    if ($TotalCap -le 0 -or $NumJobs -le 0) {
+        return $null
+    }
+
+    return ($TotalCap / $NumJobs)
+}
+
+function Get-FioDirectionalCapValues {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Settings,
+
+        [Parameter(Mandatory)]
+        [string]$ReadWrite,
+
+        [AllowNull()][double]$PerJobCap
+    )
+
+    if ($null -eq $PerJobCap -or $PerJobCap -le 0) {
+        return $null
+    }
+
+    switch ($ReadWrite) {
+        'read' { return [pscustomobject]@{ Read = $PerJobCap; Write = $null } }
+        'randread' { return [pscustomobject]@{ Read = $PerJobCap; Write = $null } }
+        'write' { return [pscustomobject]@{ Read = $null; Write = $PerJobCap } }
+        'randwrite' { return [pscustomobject]@{ Read = $null; Write = $PerJobCap } }
+        'rw' { }
+        'randrw' { }
+        default { return [pscustomobject]@{ Read = $PerJobCap; Write = $null } }
+    }
+
+    $readPercent = if ($null -ne $Settings.ReadMix) { [double]$Settings.ReadMix } else { 50.0 }
+    $writePercent = 100.0 - $readPercent
+    return [pscustomobject]@{
+        Read = if ($readPercent -gt 0) { $PerJobCap * ($readPercent / 100.0) } else { $null }
+        Write = if ($writePercent -gt 0) { $PerJobCap * ($writePercent / 100.0) } else { $null }
+    }
+}
+
+function ConvertTo-FioRateLiteral {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][Nullable[double]]$ReadValue,
+        [AllowNull()][Nullable[double]]$WriteValue
+    )
+
+    if ($null -eq $ReadValue -and $null -eq $WriteValue) {
+        return $null
+    }
+
+    if ($null -ne $ReadValue -and $null -eq $WriteValue) {
+        return [string][int64][math]::Max(1, [math]::Round($ReadValue, 0))
+    }
+
+    if ($null -eq $ReadValue -and $null -ne $WriteValue) {
+        return (',{0}' -f [int64][math]::Max(1, [math]::Round($WriteValue, 0)))
+    }
+
+    return ('{0},{1}' -f [int64][math]::Max(1, [math]::Round($ReadValue, 0)), [int64][math]::Max(1, [math]::Round($WriteValue, 0)))
 }
 
 function Get-FioCpuTopology {
@@ -707,6 +794,8 @@ function New-FioSqlBenchJobContent {
 
     $prepBlockSizeBytes = Get-FioPreparationBlockSizeBytes -Settings $Settings
     $prepQueueDepth = Get-FioPreparationQueueDepth -Settings $Settings
+    $perJobThroughputCapBytesPerSec = if ($null -ne $Settings.ThroughputCapMBps) { Get-FioPerJobCapShare -TotalCap ([double]$Settings.ThroughputCapMBps * 1MB) -NumJobs $Settings.NumJobs } else { $null }
+    $perJobIopsCap = if ($null -ne $Settings.IopsCap) { Get-FioPerJobCapShare -TotalCap ([double]$Settings.IopsCap) -NumJobs $Settings.NumJobs } else { $null }
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('[global]')
@@ -733,6 +822,19 @@ function New-FioSqlBenchJobContent {
         if ($Settings.PSObject.Properties['CpuAffinity'] -and $Settings.CpuAffinity -and $Settings.CpuAffinity.Enabled -and -not [string]::IsNullOrWhiteSpace([string]$Settings.CpuAffinity.CpuList)) {
             $lines.Add("cpus_allowed=$($Settings.CpuAffinity.CpuList)")
             $lines.Add("cpus_allowed_policy=$($Settings.CpuAffinity.Policy)")
+        }
+
+        if (@('MaxIOPs', 'MaxThroughput') -notcontains [string]$Settings.ProfileName) {
+            $throughputCaps = Get-FioDirectionalCapValues -Settings $Settings -ReadWrite ([string]$Settings.ReadWrite) -PerJobCap $perJobThroughputCapBytesPerSec
+            $iopsCaps = Get-FioDirectionalCapValues -Settings $Settings -ReadWrite ([string]$Settings.ReadWrite) -PerJobCap $perJobIopsCap
+            $rateLiteral = if ($null -ne $throughputCaps) { ConvertTo-FioRateLiteral -ReadValue $throughputCaps.Read -WriteValue $throughputCaps.Write } else { $null }
+            $rateIopsLiteral = if ($null -ne $iopsCaps) { ConvertTo-FioRateLiteral -ReadValue $iopsCaps.Read -WriteValue $iopsCaps.Write } else { $null }
+            if (-not [string]::IsNullOrWhiteSpace($rateLiteral)) {
+                $lines.Add("rate=$rateLiteral")
+            }
+            if (-not [string]::IsNullOrWhiteSpace($rateIopsLiteral)) {
+                $lines.Add("rate_iops=$rateIopsLiteral")
+            }
         }
     }
 
@@ -792,6 +894,16 @@ function New-FioSqlBenchJobContent {
                         $lines.Add('stonewall=1')
                     }
                     $lines.Add("rw=$($operation.Rw)")
+                    $throughputCaps = Get-FioDirectionalCapValues -Settings $Settings -ReadWrite ([string]$operation.Rw) -PerJobCap $perJobThroughputCapBytesPerSec
+                    $iopsCaps = Get-FioDirectionalCapValues -Settings $Settings -ReadWrite ([string]$operation.Rw) -PerJobCap $perJobIopsCap
+                    $rateLiteral = if ($null -ne $throughputCaps) { ConvertTo-FioRateLiteral -ReadValue $throughputCaps.Read -WriteValue $throughputCaps.Write } else { $null }
+                    $rateIopsLiteral = if ($null -ne $iopsCaps) { ConvertTo-FioRateLiteral -ReadValue $iopsCaps.Read -WriteValue $iopsCaps.Write } else { $null }
+                    if (-not [string]::IsNullOrWhiteSpace($rateLiteral)) {
+                        $lines.Add("rate=$rateLiteral")
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($rateIopsLiteral)) {
+                        $lines.Add("rate_iops=$rateIopsLiteral")
+                    }
                     if ($Settings.Fsync -gt 0) {
                         $lines.Add("fsync=$($Settings.Fsync)")
                     }
@@ -1269,24 +1381,121 @@ function Get-FioDiagnosticsDisplayTransform {
 
     switch ($Metric) {
         'bandwidth' {
-            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = $script:FioDiagnosticsSmoothingWindowSamples }
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = $script:FioDiagnosticsSmoothingWindowSamples; CapUpperPercentile = $script:FioDiagnosticsCapPercentile; CapMinimumSamples = $script:FioDiagnosticsCapMinimumSamples }
         }
         'iops' {
-            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = $script:FioDiagnosticsSmoothingWindowSamples }
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = $script:FioDiagnosticsSmoothingWindowSamples; CapUpperPercentile = $script:FioDiagnosticsCapPercentile; CapMinimumSamples = $script:FioDiagnosticsCapMinimumSamples }
         }
         'latencyAvg' {
-            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3 }
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3; CapUpperPercentile = $script:FioDiagnosticsCapPercentile; CapMinimumSamples = $script:FioDiagnosticsCapMinimumSamples }
         }
         'latencyMax' {
-            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3 }
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3; CapUpperPercentile = $script:FioDiagnosticsCapPercentile; CapMinimumSamples = $script:FioDiagnosticsCapMinimumSamples }
         }
         'perfmonLatency' {
-            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3 }
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 3; CapUpperPercentile = $script:FioDiagnosticsCapPercentile; CapMinimumSamples = $script:FioDiagnosticsCapMinimumSamples }
         }
         default {
-            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 1 }
+            return [pscustomobject]@{ TrimLeadingSamples = $script:FioDiagnosticsWarmupTrimSamples; SmoothingWindowSize = 1; CapUpperPercentile = $null; CapMinimumSamples = $script:FioDiagnosticsCapMinimumSamples }
         }
     }
+}
+
+function Get-FioPercentileValue {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [double[]]$Values,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(0, 100)]
+        [double]$Percentile
+    )
+
+    $orderedValues = @($Values | Where-Object { $null -ne $_ } | Sort-Object)
+    if ($orderedValues.Count -eq 0) {
+        return $null
+    }
+
+    if ($orderedValues.Count -eq 1) {
+        return [double]$orderedValues[0]
+    }
+
+    $rank = ($Percentile / 100.0) * ($orderedValues.Count - 1)
+    $lowerIndex = [int][math]::Floor($rank)
+    $upperIndex = [int][math]::Ceiling($rank)
+    if ($lowerIndex -eq $upperIndex) {
+        return [double]$orderedValues[$lowerIndex]
+    }
+
+    $weight = $rank - $lowerIndex
+    $lowerValue = [double]$orderedValues[$lowerIndex]
+    $upperValue = [double]$orderedValues[$upperIndex]
+    return ($lowerValue + (($upperValue - $lowerValue) * $weight))
+}
+
+function Get-FioDiagnosticsCappedPoints {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Points,
+
+        [AllowNull()][double]$UpperCapPercentile,
+
+        [int]$MinimumSamples = $script:FioDiagnosticsCapMinimumSamples
+    )
+
+    $orderedPoints = @($Points | Sort-Object TimeMs)
+    if ($orderedPoints.Count -eq 0 -or $null -eq $UpperCapPercentile -or $orderedPoints.Count -lt [math]::Max(2, $MinimumSamples)) {
+        return [pscustomobject]@{
+            Points = @($orderedPoints)
+            CapApplied = $false
+            CapValue = $null
+            CapPercentile = $UpperCapPercentile
+            CappedSamples = 0
+        }
+    }
+
+    $capValue = Get-FioPercentileValue -Values @($orderedPoints | ForEach-Object { [double]$_.Value }) -Percentile $UpperCapPercentile
+    if ($null -eq $capValue) {
+        return [pscustomobject]@{
+            Points = @($orderedPoints)
+            CapApplied = $false
+            CapValue = $null
+            CapPercentile = $UpperCapPercentile
+            CappedSamples = 0
+        }
+    }
+
+    $cappedSamples = 0
+    $cappedPoints = New-Object System.Collections.Generic.List[object]
+    foreach ($point in $orderedPoints) {
+        $rawValue = [double]$point.Value
+        $cappedValue = [math]::Min($rawValue, [double]$capValue)
+        if ($cappedValue -lt $rawValue) {
+            $cappedSamples++
+        }
+
+        $cappedPoints.Add([pscustomobject]@{
+            TimeMs = [int]$point.TimeMs
+            Value = [double]$cappedValue
+        })
+    }
+
+    return [pscustomobject]@{
+        Points = $cappedPoints.ToArray()
+        CapApplied = ($cappedSamples -gt 0)
+        CapValue = [double]$capValue
+        CapPercentile = $UpperCapPercentile
+        CappedSamples = $cappedSamples
+    }
+}
+
+function Get-FioDiagnosticsCapPolicyLabel {
+    [CmdletBinding()]
+    param()
+
+    return ('P{0} upper cap on steady-state throughput, IOPS, and latency' -f [int]$script:FioDiagnosticsCapPercentile)
 }
 
 function Get-FioDiagnosticsSmoothedPoints {
@@ -1527,6 +1736,7 @@ function Get-FioDiagnosticsSummary {
             LogWindowMs = $script:FioDiagnosticsWindowMs
             WarmupTrimSamples = $WarmupTrimSamples
             SmoothingWindowSamples = $SmoothingWindowSamples
+            CapPolicyLabel = Get-FioDiagnosticsCapPolicyLabel
             TimeRangeMs = $null
             MissingMetrics = @($raw.MissingMetrics)
             PresentMetrics = @($raw.PresentMetrics)
@@ -1572,6 +1782,7 @@ function Get-FioDiagnosticsSummary {
         LogWindowMs = $raw.LogWindowMs
         WarmupTrimSamples = $WarmupTrimSamples
         SmoothingWindowSamples = $SmoothingWindowSamples
+        CapPolicyLabel = Get-FioDiagnosticsCapPolicyLabel
         TimeRangeMs = $raw.TimeRangeMs
         MissingMetrics = @($raw.MissingMetrics)
         PresentMetrics = @($raw.PresentMetrics)
@@ -1754,6 +1965,8 @@ function Get-FioDiagnosticsData {
 
         $displayTransform = Get-FioDiagnosticsDisplayTransform -Metric ([string]$entry.Value.Metric)
         $points = @(Get-FioDiagnosticsSmoothedPoints -Points $rawPoints -TrimLeadingSamples $displayTransform.TrimLeadingSamples -SmoothingWindowSize $displayTransform.SmoothingWindowSize)
+        $capResult = Get-FioDiagnosticsCappedPoints -Points $points -UpperCapPercentile $displayTransform.CapUpperPercentile -MinimumSamples $displayTransform.CapMinimumSamples
+        $points = @($capResult.Points)
         $values = @($points | ForEach-Object { $_.Value })
         $series.Add([pscustomobject]@{
             Key = $entry.Value.Key
@@ -1772,6 +1985,10 @@ function Get-FioDiagnosticsData {
                 RawSampleCount = $rawPoints.Count
                 TrimmedSamples = [math]::Max(0, ($rawPoints.Count - $points.Count))
                 SmoothingWindowSamples = $displayTransform.SmoothingWindowSize
+                CapApplied = [bool]$capResult.CapApplied
+                CapValue = if ($null -ne $capResult.CapValue) { [double]$capResult.CapValue } else { $null }
+                CapPercentile = if ($null -ne $capResult.CapPercentile) { [double]$capResult.CapPercentile } else { $null }
+                CappedSamples = [int]$capResult.CappedSamples
             }
         })
     }
@@ -3608,6 +3825,7 @@ function New-FioHtmlDiagnosticsSection {
                 [pscustomobject]@{ Label = 'Window'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['LogWindowMs']) { '{0} ms' -f $Diagnostics.LogWindowMs } else { '{0} ms' -f $script:FioDiagnosticsWindowMs } },
             [pscustomobject]@{ Label = 'Warmup trim'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['WarmupTrimSamples']) { '{0} samples' -f $Diagnostics.WarmupTrimSamples } else { '{0} samples' -f $script:FioDiagnosticsWarmupTrimSamples } },
             [pscustomobject]@{ Label = 'Smoothing'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['SmoothingWindowSamples']) { '{0}-sample moving avg' -f $Diagnostics.SmoothingWindowSamples } else { '{0}-sample moving avg' -f $script:FioDiagnosticsSmoothingWindowSamples } },
+            [pscustomobject]@{ Label = 'Caps'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['CapPolicyLabel']) { [string]$Diagnostics.CapPolicyLabel } else { Get-FioDiagnosticsCapPolicyLabel } },
                 [pscustomobject]@{ Label = 'Duration'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['TimeRangeMs'] -and $null -ne $Diagnostics.TimeRangeMs) { '{0:N1} s' -f ($Diagnostics.TimeRangeMs / 1000.0) } else { '-' } },
                 [pscustomobject]@{ Label = 'Series'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['Series']) { [string](@($Diagnostics.Series).Count) } else { '0' } },
                 [pscustomobject]@{ Label = 'Source files'; Value = if ($null -ne $Diagnostics -and $Diagnostics.PSObject.Properties['SourceFiles']) { [string](@($Diagnostics.SourceFiles).Count) } else { '0' } }
@@ -3654,10 +3872,10 @@ function New-FioHtmlDiagnosticsSection {
         $perfmonQueueSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonQueue' })
         $perfmonCreditStallSeries = @($Diagnostics.Series | Where-Object { $_.Metric -eq 'perfmonCreditStalls' })
         $cards = New-Object System.Collections.Generic.List[string]
-        $cards.Add((New-FioHtmlLineChartSection -Title 'Throughput Over Time' -Series $throughputSeries -Subtitle ('Steady-state fio bandwidth view sampled every {0} ms after trimming the first {1} samples and applying a moving average.' -f $Diagnostics.LogWindowMs, $(if ($Diagnostics.PSObject.Properties['WarmupTrimSamples']) { $Diagnostics.WarmupTrimSamples } else { $script:FioDiagnosticsWarmupTrimSamples }))))
-        $cards.Add((New-FioHtmlLineChartSection -Title 'BW Stability Over Time' -Series $stabilitySeries -Subtitle ('Rolling {0}-sample coefficient of variation from the steady-state bandwidth view. Lower is steadier.' -f $script:FioDiagnosticsStabilityWindowSamples)))
-        $cards.Add((New-FioHtmlLineChartSection -Title 'IOPS Over Time' -Series $iopsSeries -Subtitle ('Steady-state fio IOPS view sampled every {0} ms after trimming the first {1} samples and applying a moving average.' -f $Diagnostics.LogWindowMs, $(if ($Diagnostics.PSObject.Properties['WarmupTrimSamples']) { $Diagnostics.WarmupTrimSamples } else { $script:FioDiagnosticsWarmupTrimSamples }))))
-        $cards.Add((New-FioHtmlLineChartSection -Title 'Completion Latency Over Time' -Series $latencySeries -Subtitle 'Steady-state completion latency view after warmup trimming and light smoothing, useful for spotting sustained stalls rather than one-window spikes.'))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'Throughput Over Time' -Series $throughputSeries -Subtitle ('Steady-state fio bandwidth view sampled every {0} ms after trimming the first {1} samples, smoothing, and applying a P{2} upper cap to suppress burst windows from service throttling.' -f $Diagnostics.LogWindowMs, $(if ($Diagnostics.PSObject.Properties['WarmupTrimSamples']) { $Diagnostics.WarmupTrimSamples } else { $script:FioDiagnosticsWarmupTrimSamples }), [int]$script:FioDiagnosticsCapPercentile)))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'BW Stability Over Time' -Series $stabilitySeries -Subtitle ('Rolling {0}-sample coefficient of variation from the capped steady-state bandwidth view. Lower is steadier.' -f $script:FioDiagnosticsStabilityWindowSamples)))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'IOPS Over Time' -Series $iopsSeries -Subtitle ('Steady-state fio IOPS view sampled every {0} ms after trimming, smoothing, and applying a P{1} upper cap.' -f $Diagnostics.LogWindowMs, [int]$script:FioDiagnosticsCapPercentile)))
+        $cards.Add((New-FioHtmlLineChartSection -Title 'Completion Latency Over Time' -Series $latencySeries -Subtitle ('Steady-state completion latency after warmup trimming, light smoothing, and a P{0} upper cap so sustained limits are clearer than one-window spikes.' -f [int]$script:FioDiagnosticsCapPercentile)))
         if ($perfmonLatencySeries.Count -gt 0) {
             $cards.Add((New-FioHtmlLineChartSection -Title 'SMB Client Latency Over Time' -Series $perfmonLatencySeries -Subtitle 'PerfMon SMB client read/write latency counters. This is client-observed SMB latency, useful for spotting queueing beyond storage-service latency.'))
         }
@@ -3754,10 +3972,10 @@ function Get-FioDiagnosticsChartModels {
     }
 
     $definitions = @(
-        [pscustomobject]@{ Key = 'bandwidth'; Title = 'Throughput Over Time'; Subtitle = 'Steady-state fio bandwidth samples across the selected run, after warmup trimming and moving-average smoothing.'; YAxisTitle = 'MB/s' }
-        [pscustomobject]@{ Key = 'bandwidthStability'; Title = 'BW Stability Over Time'; Subtitle = 'Rolling bandwidth coefficient of variation from the steady-state view. Lower percentages indicate steadier delivery.'; YAxisTitle = 'CV %' }
-        [pscustomobject]@{ Key = 'iops'; Title = 'IOPS Over Time'; Subtitle = 'Steady-state fio IOPS samples across the selected run, after warmup trimming and moving-average smoothing.'; YAxisTitle = 'IOPS' }
-        [pscustomobject]@{ Key = 'latency'; Title = 'Completion Latency Over Time'; Subtitle = 'Steady-state average and max completion latency, useful for spotting sustained stalls and throttling.'; YAxisTitle = 'Milliseconds' }
+        [pscustomobject]@{ Key = 'bandwidth'; Title = 'Throughput Over Time'; Subtitle = ('Steady-state fio bandwidth samples across the selected run, after warmup trimming, moving-average smoothing, and a P{0} upper cap.' -f [int]$script:FioDiagnosticsCapPercentile); YAxisTitle = 'MB/s' }
+        [pscustomobject]@{ Key = 'bandwidthStability'; Title = 'BW Stability Over Time'; Subtitle = 'Rolling bandwidth coefficient of variation from the capped steady-state view. Lower percentages indicate steadier delivery.'; YAxisTitle = 'CV %' }
+        [pscustomobject]@{ Key = 'iops'; Title = 'IOPS Over Time'; Subtitle = ('Steady-state fio IOPS samples across the selected run, after warmup trimming, moving-average smoothing, and a P{0} upper cap.' -f [int]$script:FioDiagnosticsCapPercentile); YAxisTitle = 'IOPS' }
+        [pscustomobject]@{ Key = 'latency'; Title = 'Completion Latency Over Time'; Subtitle = ('Steady-state average and max completion latency after trimming, smoothing, and a P{0} upper cap to suppress isolated backend throttling spikes.' -f [int]$script:FioDiagnosticsCapPercentile); YAxisTitle = 'Milliseconds' }
         [pscustomobject]@{ Key = 'perfmonLatency'; Title = 'SMB Client Latency Over Time'; Subtitle = 'PerfMon SMB client read/write latency counters captured on the benchmark host, trimmed to the steady-state window.'; YAxisTitle = 'Milliseconds' }
         [pscustomobject]@{ Key = 'perfmonQueue'; Title = 'SMB Queue Over Time'; Subtitle = 'PerfMon SMB client queue depth. Sustained buildup usually means the path is saturated or being throttled.'; YAxisTitle = 'Queue depth' }
         [pscustomobject]@{ Key = 'perfmonCreditStalls'; Title = 'SMB Credit Stalls Over Time'; Subtitle = 'PerfMon SMB credit stalls per second. Non-zero values suggest client-side flow control while saturated.'; YAxisTitle = 'Stalls/sec' }
@@ -4059,25 +4277,25 @@ function Export-FioSqlBenchHtmlReportStatic {
                     'Iops' {
                         return [pscustomobject]@{
                             Label = ('{0} IOPS' -f $Operation)
-                            Context = 'Steady-state focus'
+                            Context = 'Steady-state'
                             Primary = $iopsText
-                            Secondary = ('Paired BW {0}' -f $bandwidthText)
+                            Secondary = ('Pair BW {0}' -f $bandwidthText)
                         }
                     }
                     'Latency' {
                         return [pscustomobject]@{
-                            Label = ('{0} p99 latency' -f $Operation)
-                            Context = 'Tail-latency focus'
+                            Label = ('{0} p99' -f $Operation)
+                            Context = 'Latest run'
                             Primary = $p99Ms
-                            Secondary = ('Current IOPS {0}' -f $iopsText)
+                            Secondary = ('IOPS {0}' -f $iopsText)
                         }
                     }
                     default {
                         return [pscustomobject]@{
-                            Label = ('{0} throughput' -f $Operation)
-                            Context = 'Steady-state focus'
+                            Label = ('{0} BW' -f $Operation)
+                            Context = 'Steady-state'
                             Primary = $bandwidthText
-                            Secondary = ('Current IOPS {0}' -f $iopsText)
+                            Secondary = ('IOPS {0}' -f $iopsText)
                         }
                     }
                 }
@@ -4361,7 +4579,7 @@ function Export-FioSqlBenchHtmlReportStatic {
                 </div>
             <div class="profile-metric profile-metric-latency">
                         <span class="profile-metric-label">Latency envelope</span>
-                    <span class="profile-metric-context">Latest run p99 with diagnostics state</span>
+                    <span class="profile-metric-context">Latest run p99</span>
                     <div class="profile-latency-grid">
                         <div class="profile-latency-stat{16}">
                             <span class="profile-latency-key">Read</span>
@@ -4374,7 +4592,7 @@ function Export-FioSqlBenchHtmlReportStatic {
                             {21}
                         </div>
                     </div>
-                    <span class="profile-metric-note">Diagnostics state: {22}</span>
+                    <span class="profile-metric-note">Diag state: {22}</span>
                 </div>
         </div>
         <p class="profile-analysis">{23}</p>
