@@ -2528,15 +2528,14 @@ function Import-FioSqlBenchHistory {
     $summaryFiles = @(Get-ChildItem -LiteralPath $ResultsRoot -Filter 'summary.json' -Recurse -File | Sort-Object FullName)
     $runs = foreach ($file in $summaryFiles) {
         $rootSummary = ConvertFrom-FioJsonDocument -InputObject (Get-Content -LiteralPath $file.FullName -Raw)
-        $iterations = if ($rootSummary.PSObject.Properties['Iterations']) {
-            @($rootSummary.Iterations)
-        }
-        elseif ($rootSummary.PSObject.Properties['Iteration']) {
-            @($rootSummary)
-        }
-        else {
-            @()
-        }
+        $iterations = [object[]]@(
+            if ($rootSummary.PSObject.Properties['Iterations']) {
+                @($rootSummary.Iterations)
+            }
+            elseif ($rootSummary.PSObject.Properties['Iteration']) {
+                $rootSummary
+            }
+        )
 
         if ($iterations.Count -eq 0) {
             continue
@@ -4060,22 +4059,25 @@ function Export-FioSqlBenchHtmlReportStatic {
                     'Iops' {
                         return [pscustomobject]@{
                             Label = ('{0} IOPS' -f $Operation)
+                            Context = 'Steady-state focus'
                             Primary = $iopsText
-                            Secondary = $bandwidthText
+                            Secondary = ('Paired BW {0}' -f $bandwidthText)
                         }
                     }
                     'Latency' {
                         return [pscustomobject]@{
-                            Label = ('{0} p99' -f $Operation)
+                            Label = ('{0} p99 latency' -f $Operation)
+                            Context = 'Tail-latency focus'
                             Primary = $p99Ms
-                            Secondary = $iopsText
+                            Secondary = ('Current IOPS {0}' -f $iopsText)
                         }
                     }
                     default {
                         return [pscustomobject]@{
                             Label = ('{0} throughput' -f $Operation)
+                            Context = 'Steady-state focus'
                             Primary = $bandwidthText
-                            Secondary = $iopsText
+                            Secondary = ('Current IOPS {0}' -f $iopsText)
                         }
                     }
                 }
@@ -4129,6 +4131,10 @@ function Export-FioSqlBenchHtmlReportStatic {
         $bestWriteIopsProfileRun = @($iopsFocusedLatestRuns | Sort-Object { [double]$_.Write.Iops } -Descending | Select-Object -First 1)[0]
         $bestReadThroughputProfileRun = @($throughputFocusedLatestRuns | Sort-Object { [double]$_.Read.BandwidthMBps } -Descending | Select-Object -First 1)[0]
         $bestWriteThroughputProfileRun = @($throughputFocusedLatestRuns | Sort-Object { [double]$_.Write.BandwidthMBps } -Descending | Select-Object -First 1)[0]
+        $readIopsTriplet = Get-FioHistoricalTriplet -Values @($iopsFocusedLatestRuns | ForEach-Object { $_.Read.Iops })
+        $writeIopsTriplet = Get-FioHistoricalTriplet -Values @($iopsFocusedLatestRuns | ForEach-Object { $_.Write.Iops })
+        $readThroughputTriplet = Get-FioHistoricalTriplet -Values @($throughputFocusedLatestRuns | ForEach-Object { $_.Read.BandwidthMBps })
+        $writeThroughputTriplet = Get-FioHistoricalTriplet -Values @($throughputFocusedLatestRuns | ForEach-Object { $_.Write.BandwidthMBps })
         $lowestMeanLatencyResult = @(
             foreach ($run in $profileLatestRuns) {
                 foreach ($row in @(Get-FioHtmlActiveAssessmentRows -Run $run | Where-Object { $null -ne $_.MeanMs -and $_.MeanMs -gt 0 })) {
@@ -4143,6 +4149,8 @@ function Export-FioSqlBenchHtmlReportStatic {
         )
         $lowestReadLatencyResult = $lowestMeanLatencyResult | Where-Object { $_.Operation -eq 'Read' } | Sort-Object MeanMs, Profile | Select-Object -First 1
         $lowestWriteLatencyResult = $lowestMeanLatencyResult | Where-Object { $_.Operation -eq 'Write' } | Sort-Object MeanMs, Profile | Select-Object -First 1
+        $readLatencyTriplet = Get-FioHistoricalTriplet -Values @($lowestMeanLatencyResult | Where-Object { $_.Operation -eq 'Read' } | ForEach-Object { $_.MeanMs })
+        $writeLatencyTriplet = Get-FioHistoricalTriplet -Values @($lowestMeanLatencyResult | Where-Object { $_.Operation -eq 'Write' } | ForEach-Object { $_.MeanMs })
         $newestProfileSnapshot = @($profileLatestRuns | Sort-Object TimestampUtc -Descending | Select-Object -First 1)[0]
 
         $heroMetricCards = @(
@@ -4162,74 +4170,96 @@ function Export-FioSqlBenchHtmlReportStatic {
         }
 
         $bestReadIopsProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestReadIopsProfileRun.Profile)
-        $bestReadIopsValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N0} IOPS' -f [double]$bestReadIopsProfileRun.Read.Iops))
+        $bestReadIopsPeakHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N0} IOPS' -f [double]$bestReadIopsProfileRun.Read.Iops))
+        $bestReadIopsValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N0} IOPS' -f [double]$readIopsTriplet.Avg))
+        $bestReadIopsRangeHtml = [System.Net.WebUtility]::HtmlEncode(('min {0:N0} · max {1:N0}' -f [double]$readIopsTriplet.Min, [double]$readIopsTriplet.Max))
         $bestWriteIopsProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestWriteIopsProfileRun.Profile)
-        $bestWriteIopsValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N0} IOPS' -f [double]$bestWriteIopsProfileRun.Write.Iops))
+        $bestWriteIopsPeakHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N0} IOPS' -f [double]$bestWriteIopsProfileRun.Write.Iops))
+        $bestWriteIopsValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N0} IOPS' -f [double]$writeIopsTriplet.Avg))
+        $bestWriteIopsRangeHtml = [System.Net.WebUtility]::HtmlEncode(('min {0:N0} · max {1:N0}' -f [double]$writeIopsTriplet.Min, [double]$writeIopsTriplet.Max))
         $bestReadThroughputProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestReadThroughputProfileRun.Profile)
-        $bestReadThroughputValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$bestReadThroughputProfileRun.Read.BandwidthMBps))
+        $bestReadThroughputPeakHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$bestReadThroughputProfileRun.Read.BandwidthMBps))
+        $bestReadThroughputValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$readThroughputTriplet.Avg))
+        $bestReadThroughputRangeHtml = [System.Net.WebUtility]::HtmlEncode(('min {0:N2} · max {1:N2}' -f [double]$readThroughputTriplet.Min, [double]$readThroughputTriplet.Max))
         $bestWriteThroughputProfileHtml = [System.Net.WebUtility]::HtmlEncode([string]$bestWriteThroughputProfileRun.Profile)
-        $bestWriteThroughputValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$bestWriteThroughputProfileRun.Write.BandwidthMBps))
+        $bestWriteThroughputPeakHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$bestWriteThroughputProfileRun.Write.BandwidthMBps))
+        $bestWriteThroughputValueHtml = [System.Net.WebUtility]::HtmlEncode(('{0:N2} MB/s' -f [double]$writeThroughputTriplet.Avg))
+        $bestWriteThroughputRangeHtml = [System.Net.WebUtility]::HtmlEncode(('min {0:N2} · max {1:N2}' -f [double]$writeThroughputTriplet.Min, [double]$writeThroughputTriplet.Max))
         $lowestReadLatencyContextHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode([string]$lowestReadLatencyResult.Profile) } else { '-' }
-        $lowestReadLatencyValueHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$lowestReadLatencyResult.MeanMs)) } else { '-' }
+        $lowestReadLatencyPeakHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$lowestReadLatencyResult.MeanMs)) } else { '-' }
+        $lowestReadLatencyValueHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$readLatencyTriplet.Avg)) } else { '-' }
+        $lowestReadLatencyRangeHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('min {0:N2} · max {1:N2}' -f [double]$readLatencyTriplet.Min, [double]$readLatencyTriplet.Max)) } else { '-' }
         $lowestReadLatencyAssessmentHtml = if ($null -ne $lowestReadLatencyResult) { [System.Net.WebUtility]::HtmlEncode([string]$lowestReadLatencyResult.Assessment) } else { '-' }
         $lowestWriteLatencyContextHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode([string]$lowestWriteLatencyResult.Profile) } else { '-' }
-        $lowestWriteLatencyValueHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$lowestWriteLatencyResult.MeanMs)) } else { '-' }
+        $lowestWriteLatencyPeakHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$lowestWriteLatencyResult.MeanMs)) } else { '-' }
+        $lowestWriteLatencyValueHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('{0:N2} ms' -f [double]$writeLatencyTriplet.Avg)) } else { '-' }
+        $lowestWriteLatencyRangeHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode(('min {0:N2} · max {1:N2}' -f [double]$writeLatencyTriplet.Min, [double]$writeLatencyTriplet.Max)) } else { '-' }
         $lowestWriteLatencyAssessmentHtml = if ($null -ne $lowestWriteLatencyResult) { [System.Net.WebUtility]::HtmlEncode([string]$lowestWriteLatencyResult.Assessment) } else { '-' }
 
         $highlightHtml = @(
             @'
     <article class="highlight-card">
-        <div class="metric-label">IOPS Leaders</div>
+        <div class="metric-label">IOPS Summary</div>
         <div class="highlight-stat-grid">
             <div class="highlight-stat">
-                <div class="highlight-stat-label tone-read">Max Read IOPS</div>
-                <div class="highlight-stat-context">{0}</div>
+                <div class="highlight-stat-label tone-read">Read IOPS</div>
+                <div class="highlight-stat-context">Steady-state avg</div>
                 <div class="highlight-metric tone-read">{1}</div>
+                <div class="highlight-secondary">{2}</div>
+                <div class="highlight-tertiary">Peak observed: {3} on {0}</div>
             </div>
             <div class="highlight-stat">
-                <div class="highlight-stat-label tone-write">Max Write IOPS</div>
-                <div class="highlight-stat-context">{2}</div>
-                <div class="highlight-metric tone-write">{3}</div>
+                <div class="highlight-stat-label tone-write">Write IOPS</div>
+                <div class="highlight-stat-context">Steady-state avg</div>
+                <div class="highlight-metric tone-write">{5}</div>
+                <div class="highlight-secondary">{6}</div>
+                <div class="highlight-tertiary">Peak observed: {7} on {4}</div>
             </div>
         </div>
     </article>
-'@ -f $bestReadIopsProfileHtml, $bestReadIopsValueHtml, $bestWriteIopsProfileHtml, $bestWriteIopsValueHtml
+'@ -f $bestReadIopsProfileHtml, $bestReadIopsValueHtml, $bestReadIopsRangeHtml, $bestReadIopsPeakHtml, $bestWriteIopsProfileHtml, $bestWriteIopsValueHtml, $bestWriteIopsRangeHtml, $bestWriteIopsPeakHtml
             @'
     <article class="highlight-card">
-        <div class="metric-label">Throughput Leaders</div>
+        <div class="metric-label">Throughput Summary</div>
         <div class="highlight-stat-grid">
             <div class="highlight-stat">
-                <div class="highlight-stat-label tone-read">Max Read Throughput</div>
-                <div class="highlight-stat-context">{0}</div>
+                <div class="highlight-stat-label tone-read">Read Throughput</div>
+                <div class="highlight-stat-context">Steady-state avg</div>
                 <div class="highlight-metric tone-read">{1}</div>
+                <div class="highlight-secondary">{2}</div>
+                <div class="highlight-tertiary">Peak observed: {3} on {0}</div>
             </div>
             <div class="highlight-stat">
-                <div class="highlight-stat-label tone-write">Max Write Throughput</div>
-                <div class="highlight-stat-context">{2}</div>
-                <div class="highlight-metric tone-write">{3}</div>
+                <div class="highlight-stat-label tone-write">Write Throughput</div>
+                <div class="highlight-stat-context">Steady-state avg</div>
+                <div class="highlight-metric tone-write">{5}</div>
+                <div class="highlight-secondary">{6}</div>
+                <div class="highlight-tertiary">Peak observed: {7} on {4}</div>
             </div>
         </div>
     </article>
-'@ -f $bestReadThroughputProfileHtml, $bestReadThroughputValueHtml, $bestWriteThroughputProfileHtml, $bestWriteThroughputValueHtml
+'@ -f $bestReadThroughputProfileHtml, $bestReadThroughputValueHtml, $bestReadThroughputRangeHtml, $bestReadThroughputPeakHtml, $bestWriteThroughputProfileHtml, $bestWriteThroughputValueHtml, $bestWriteThroughputRangeHtml, $bestWriteThroughputPeakHtml
             @'
     <article class="highlight-card">
-        <div class="metric-label">Latency Leaders</div>
+        <div class="metric-label">Latency Summary</div>
         <div class="highlight-stat-grid">
             <div class="highlight-stat">
-                <div class="highlight-stat-label tone-read">Lowest Read Mean Latency</div>
-                <div class="highlight-stat-context">{0}</div>
+                <div class="highlight-stat-label tone-read">Read Mean Latency</div>
+                <div class="highlight-stat-context">Steady-state avg</div>
                 <div class="highlight-metric tone-read">{1}</div>
-                <div class="highlight-secondary">{2} assessment on current mean latency</div>
+                <div class="highlight-secondary">{2}</div>
+                <div class="highlight-tertiary">Best current low: {3} on {0} · {4} assessment</div>
             </div>
             <div class="highlight-stat">
-                <div class="highlight-stat-label tone-write">Lowest Write Mean Latency</div>
-                <div class="highlight-stat-context">{3}</div>
-                <div class="highlight-metric tone-write">{4}</div>
-                <div class="highlight-secondary">{5} assessment on current mean latency</div>
+                <div class="highlight-stat-label tone-write">Write Mean Latency</div>
+                <div class="highlight-stat-context">Steady-state avg</div>
+                <div class="highlight-metric tone-write">{6}</div>
+                <div class="highlight-secondary">{7}</div>
+                <div class="highlight-tertiary">Best current low: {8} on {5} · {9} assessment</div>
             </div>
         </div>
     </article>
-'@ -f $lowestReadLatencyContextHtml, $lowestReadLatencyValueHtml, $lowestReadLatencyAssessmentHtml, $lowestWriteLatencyContextHtml, $lowestWriteLatencyValueHtml, $lowestWriteLatencyAssessmentHtml
+'@ -f $lowestReadLatencyContextHtml, $lowestReadLatencyValueHtml, $lowestReadLatencyRangeHtml, $lowestReadLatencyPeakHtml, $lowestReadLatencyAssessmentHtml, $lowestWriteLatencyContextHtml, $lowestWriteLatencyValueHtml, $lowestWriteLatencyRangeHtml, $lowestWriteLatencyPeakHtml, $lowestWriteLatencyAssessmentHtml
         )
 
         $latestByProfileHtml = foreach ($run in @($profileLatestRuns | Sort-Object Profile)) {
@@ -4287,9 +4317,11 @@ function Export-FioSqlBenchHtmlReportStatic {
                 $assessmentLabelHtml = [System.Net.WebUtility]::HtmlEncode([string]$assessment.Label)
                 $targetTextHtml = [System.Net.WebUtility]::HtmlEncode(('{0} · {1}' -f $run.TargetType, $run.TargetPath))
                 $readLabelHtml = [System.Net.WebUtility]::HtmlEncode([string]$readMetricModel.Label)
+                $readContextHtml = [System.Net.WebUtility]::HtmlEncode([string]$readMetricModel.Context)
                 $readPrimaryHtml = [System.Net.WebUtility]::HtmlEncode([string]$readMetricModel.Primary)
                 $readSecondaryHtml = [System.Net.WebUtility]::HtmlEncode([string]$readMetricModel.Secondary)
                 $writeLabelHtml = [System.Net.WebUtility]::HtmlEncode([string]$writeMetricModel.Label)
+                $writeContextHtml = [System.Net.WebUtility]::HtmlEncode([string]$writeMetricModel.Context)
                 $writePrimaryHtml = [System.Net.WebUtility]::HtmlEncode([string]$writeMetricModel.Primary)
                 $writeSecondaryHtml = [System.Net.WebUtility]::HtmlEncode([string]$writeMetricModel.Secondary)
                 $readP99NumberHtml = [System.Net.WebUtility]::HtmlEncode([string]$readP99Number)
@@ -4317,34 +4349,37 @@ function Export-FioSqlBenchHtmlReportStatic {
         <div class="profile-metric-grid">
             <div class="profile-metric profile-metric-primary">
             <span class="profile-metric-label">{8}</span>
-            <span class="profile-metric-value">{9}</span>
-            <span class="profile-metric-note">{10}</span>
+            <span class="profile-metric-context">{9}</span>
+            <span class="profile-metric-value">{10}</span>
+            <span class="profile-metric-note">{11}</span>
                 </div>
             <div class="profile-metric profile-metric-primary">
-            <span class="profile-metric-label">{11}</span>
-            <span class="profile-metric-value">{12}</span>
-            <span class="profile-metric-note">{13}</span>
+            <span class="profile-metric-label">{12}</span>
+            <span class="profile-metric-context">{13}</span>
+            <span class="profile-metric-value">{14}</span>
+            <span class="profile-metric-note">{15}</span>
                 </div>
             <div class="profile-metric profile-metric-latency">
                         <span class="profile-metric-label">Latency envelope</span>
+                    <span class="profile-metric-context">Latest run p99 with diagnostics state</span>
                     <div class="profile-latency-grid">
-                        <div class="profile-latency-stat{14}">
+                        <div class="profile-latency-stat{16}">
                             <span class="profile-latency-key">Read</span>
-                            <span class="profile-latency-number">{15}</span>
-                            {16}
+                            <span class="profile-latency-number">{17}</span>
+                            {18}
                         </div>
-                        <div class="profile-latency-stat{17}">
+                        <div class="profile-latency-stat{19}">
                             <span class="profile-latency-key">Write</span>
-                            <span class="profile-latency-number">{18}</span>
-                            {19}
+                            <span class="profile-latency-number">{20}</span>
+                            {21}
                         </div>
                     </div>
-                    <span class="profile-metric-note">Diagnostics coverage: {20}</span>
+                    <span class="profile-metric-note">Diagnostics state: {22}</span>
                 </div>
         </div>
-        <p class="profile-analysis">{21}</p>
+        <p class="profile-analysis">{23}</p>
 </article>
-'@ -f $profileNameHtml, $profileStampHtml, $diagnosticAnchorHtml, $focusLabelHtml, $assessmentClass, $assessmentLabelHtml, $targetTextHtml, $profileDetailBadges, $readLabelHtml, $readPrimaryHtml, $readSecondaryHtml, $writeLabelHtml, $writePrimaryHtml, $writeSecondaryHtml, $readLatencyClassSuffix, $readP99NumberHtml, $readP99UnitHtml, $writeLatencyClassSuffix, $writeP99NumberHtml, $writeP99UnitHtml, $diagnosticsDetailHtml, $sqlFitBlurbHtml, ($stabilityBadgeHtml -join '')
+'@ -f $profileNameHtml, $profileStampHtml, $diagnosticAnchorHtml, $focusLabelHtml, $assessmentClass, $assessmentLabelHtml, $targetTextHtml, $profileDetailBadges, $readLabelHtml, $readContextHtml, $readPrimaryHtml, $readSecondaryHtml, $writeLabelHtml, $writeContextHtml, $writePrimaryHtml, $writeSecondaryHtml, $readLatencyClassSuffix, $readP99NumberHtml, $readP99UnitHtml, $writeLatencyClassSuffix, $writeP99NumberHtml, $writeP99UnitHtml, $diagnosticsDetailHtml, $sqlFitBlurbHtml, ($stabilityBadgeHtml -join '')
         }
 
         $coverageRows = @(
@@ -4569,7 +4604,7 @@ function Export-FioSqlBenchHtmlReportStatic {
         main {
             max-width: 1480px;
             margin: 0 auto;
-            padding: 26px 18px 48px;
+            padding: 22px 16px 40px;
         }
         h1, h2, h3, p { margin: 0; }
         .hero, .section-card, .metric-card, .profile-card, .highlight-card, .chart-card, .collapsible-table {
@@ -4580,8 +4615,8 @@ function Export-FioSqlBenchHtmlReportStatic {
             backdrop-filter: blur(12px);
         }
         .hero {
-            padding: 26px;
-            margin-bottom: 18px;
+            padding: 22px;
+            margin-bottom: 16px;
         }
         .hero-title {
             font-size: 2.2rem;
@@ -4591,9 +4626,9 @@ function Export-FioSqlBenchHtmlReportStatic {
         }
         .hero-subtitle {
             color: var(--muted);
-            font-size: 0.92rem;
-            line-height: 1.45;
-            max-width: 72ch;
+            font-size: 0.88rem;
+            line-height: 1.4;
+            max-width: 68ch;
         }
         .hero-meta {
             display: flex;
@@ -4605,14 +4640,14 @@ function Export-FioSqlBenchHtmlReportStatic {
         }
         .metric-grid, .latest-grid, .highlight-grid, .diagnostic-grid {
             display: grid;
-            gap: 16px;
+            gap: 12px;
         }
         .metric-grid {
             grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-            margin-top: 18px;
+            margin-top: 14px;
         }
         .metric-card, .highlight-card {
-            padding: 18px;
+            padding: 15px 16px;
         }
         .metric-label, .profile-metric-label {
             display: block;
@@ -4624,28 +4659,28 @@ function Export-FioSqlBenchHtmlReportStatic {
             margin-bottom: 6px;
         }
         .metric-value {
-            font-size: 1.46rem;
+            font-size: 1.34rem;
             font-weight: 800;
         }
         .highlight-grid {
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            margin: 18px 0 22px;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            margin: 14px 0 18px;
         }
         .highlight-card {
             background: linear-gradient(180deg, rgba(15,23,42,0.98), rgba(30,41,59,0.96));
             color: #f8fafc;
-            min-height: 168px;
-            padding: 18px 20px;
+            min-height: 154px;
+            padding: 15px 16px;
         }
         .highlight-card .metric-label {
             color: #93a4b8;
-            margin-bottom: 12px;
+            margin-bottom: 10px;
         }
         .highlight-stat-grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 18px;
-            min-height: 100px;
+            gap: 14px;
+            min-height: 92px;
         }
         .highlight-stat {
             min-width: 0;
@@ -4656,17 +4691,19 @@ function Export-FioSqlBenchHtmlReportStatic {
             min-height: 100px;
         }
         .highlight-stat-label {
-            font-size: 0.72rem;
+            font-size: 0.69rem;
             letter-spacing: 0.07em;
             text-transform: uppercase;
             font-weight: 800;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
         .highlight-stat-context {
             color: #dbe5f3;
-            font-size: 0.98rem;
-            font-weight: 750;
-            margin-bottom: 8px;
+            font-size: 0.74rem;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            margin-bottom: 6px;
             line-height: 1.1;
         }
         .highlight-card .tone-read {
@@ -4682,21 +4719,27 @@ function Export-FioSqlBenchHtmlReportStatic {
             color: #fbbf24;
         }
         .highlight-metric {
-            font-size: 1.98rem;
+            font-size: 1.68rem;
             font-weight: 800;
             line-height: 0.98;
             letter-spacing: -0.03em;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
         .highlight-secondary {
             color: #d5deea;
-            font-size: 0.88rem;
-            line-height: 1.25;
-            margin-top: 10px;
+            font-size: 0.8rem;
+            line-height: 1.22;
+            margin-top: 2px;
+        }
+        .highlight-tertiary {
+            color: #93a4b8;
+            font-size: 0.74rem;
+            line-height: 1.28;
+            margin-top: 8px;
         }
         .section-card {
-            padding: 18px;
-            margin-bottom: 18px;
+            padding: 16px;
+            margin-bottom: 16px;
         }
         .section-card.section-toggle {
             padding: 0;
@@ -4707,13 +4750,13 @@ function Export-FioSqlBenchHtmlReportStatic {
             justify-content: space-between;
             align-items: flex-start;
             gap: 12px;
-            margin-bottom: 14px;
+            margin-bottom: 12px;
         }
         .section-heading p {
             color: var(--muted);
-            font-size: 0.86rem;
-            line-height: 1.38;
-            margin-top: 4px;
+            font-size: 0.82rem;
+            line-height: 1.34;
+            margin-top: 3px;
         }
         .section-heading h2 {
             font-size: 1.06rem;
@@ -4772,7 +4815,7 @@ function Export-FioSqlBenchHtmlReportStatic {
             grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
         }
         .profile-card {
-            padding: 18px;
+            padding: 16px;
             background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(238,244,251,0.98));
             box-shadow: 0 20px 48px rgba(15,23,42,0.08);
             border-color: rgba(148,163,184,0.2);
@@ -4782,7 +4825,7 @@ function Export-FioSqlBenchHtmlReportStatic {
             justify-content: space-between;
             gap: 12px;
             align-items: flex-start;
-            margin-bottom: 12px;
+            margin-bottom: 10px;
         }
         .profile-card-badges {
             display: flex;
@@ -4815,30 +4858,30 @@ function Export-FioSqlBenchHtmlReportStatic {
         }
         .profile-target {
             color: #334155;
-            font-size: 0.84rem;
-            line-height: 1.35;
-            margin-bottom: 10px;
+            font-size: 0.8rem;
+            line-height: 1.28;
+            margin-bottom: 8px;
             word-break: break-word;
-            padding-bottom: 8px;
+            padding-bottom: 6px;
             border-bottom: 1px solid rgba(148,163,184,0.14);
         }
         .profile-detail-badges {
             display: flex;
             flex-wrap: wrap;
-            gap: 7px;
-            margin: 0 0 12px;
+            gap: 6px;
+            margin: 0 0 10px;
         }
         .profile-metric-grid {
             display: grid;
             grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 12px;
+            gap: 10px;
         }
         .profile-metric {
             border: 1px solid rgba(148,163,184,0.18);
             border-radius: 18px;
             background: linear-gradient(180deg, rgba(255,255,255,1), rgba(240,245,251,0.98));
-            padding: 12px 14px;
-            min-height: 108px;
+            padding: 10px 12px;
+            min-height: 98px;
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.72);
         }
         .profile-metric-primary {
@@ -4852,16 +4895,26 @@ function Export-FioSqlBenchHtmlReportStatic {
         .profile-metric-value {
             display: block;
             font-weight: 800;
-            font-size: 1.28rem;
+            font-size: 1.18rem;
             line-height: 1.12;
             letter-spacing: -0.02em;
         }
+        .profile-metric-context {
+            display: block;
+            margin-top: -2px;
+            margin-bottom: 6px;
+            color: #475569;
+            font-size: 0.7rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
         .profile-metric-note {
             display: block;
-            margin-top: 8px;
+            margin-top: 6px;
             color: var(--muted);
-            font-size: 0.76rem;
-            line-height: 1.25;
+            font-size: 0.72rem;
+            line-height: 1.2;
         }
         .profile-latency-grid {
             display: grid;
@@ -4915,10 +4968,10 @@ function Export-FioSqlBenchHtmlReportStatic {
         }
         .profile-analysis,
         .diagnostic-summary-analysis {
-            margin-top: 10px;
+            margin-top: 8px;
             color: #475569;
-            font-size: 0.8rem;
-            line-height: 1.4;
+            font-size: 0.76rem;
+            line-height: 1.34;
             max-width: 90ch;
         }
         .focus-pill {
@@ -5315,7 +5368,7 @@ function Export-FioSqlBenchHtmlReportStatic {
     <main>
         <section class='hero'>
             <h1 class='hero-title'>$([System.Net.WebUtility]::HtmlEncode($Title))</h1>
-            <p class='hero-subtitle'>Cross-profile benchmark scan built from the freshest run in each profile, with throughput, BW stability, IOPS, latency, and diagnostics coverage prioritized for quick comparison.</p>
+            <p class='hero-subtitle'>Cross-profile benchmark scan built from the freshest run in each profile, with compact steady-state summaries first and peak context called out separately.</p>
             <div class='hero-meta'>
                 <span>Generated $([System.Net.WebUtility]::HtmlEncode((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')))</span>
                 <span>Results root: $([System.Net.WebUtility]::HtmlEncode($resultsRootText))</span>
@@ -5337,7 +5390,7 @@ function Export-FioSqlBenchHtmlReportStatic {
             <div class='section-heading'>
                 <div>
                     <h2>Cross-Profile Highlights</h2>
-                    <p>The overview compares the freshest run from every profile present in history.</p>
+                    <p>The overview compares the freshest run from every profile, leads with steady-state averages and ranges, and keeps peak context separate.</p>
                 </div>
             </div>
             <div class='highlight-grid'>
@@ -5346,7 +5399,7 @@ function Export-FioSqlBenchHtmlReportStatic {
             <div class='section-heading'>
                 <div>
                     <h2>Latest By Profile</h2>
-                    <p>Each card represents the newest run captured for that profile.</p>
+                    <p>Each card shows the newest run for that profile using the same compact focus, context, and latency pattern as the overview.</p>
                 </div>
             </div>
             <div class='latest-grid'>
