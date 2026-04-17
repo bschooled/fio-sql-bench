@@ -2,6 +2,20 @@
 
 `fio-sql-bench` is a Windows-first PowerShell harness for running file-based `fio` benchmarks that approximate common SQL Server storage patterns on either local disks or SMB shares. It produces SQL-oriented console interpretation, per-run JSON/CSV/HTML artifacts, and a historical HTML dashboard for comparing profile baselines over time.
 
+## First Run
+
+If Windows marked the repo contents as downloaded files, unblock them before running the scripts:
+
+```powershell
+Get-ChildItem -Recurse | Unblock-File
+```
+
+If your current user policy does not yet allow local signed scripts, set it once for the current user:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
 ## Scope
 
 Version 1 stays intentionally narrow:
