@@ -16,10 +16,14 @@ Version 1 stays intentionally narrow:
 ## Current Highlights
 
 - Native self-contained HTML reports for both per-run and historical views; no external module is required to render the dashboards.
+- Compatible with both PowerShell 7 and Windows PowerShell 5.1, including Windows Server builds where `ConvertFrom-Json -Depth` is unavailable.
 - SQL-aware latency interpretation in the console and HTML, including `P99.9`, worst-worker `P99`, and stability (`CV`) indicators.
-- Optional `-EnableLogs` telemetry that captures windowed fio throughput, IOPS, and completion-latency logs and surfaces them as diagnostics charts.
+- Optional `-EnableLogs` telemetry that captures windowed fio throughput, IOPS, and completion-latency logs and, on SMB targets, host-side SMB client PerfMon counters for latency, queue depth, and credit stalls.
+- Diagnostics charts focus on steady-state behavior by trimming early warmup windows, applying light smoothing, and capping isolated burst spikes in the rendered view.
+- Optional fio pacing caps via `-ThroughputCapMBps` and `-IopsCap`, with workload-aware limiter selection when both are supplied.
+- Optional `-Optimized` SMB mode that applies a benchmark-oriented client tuning pass for the active run and restores the original settings afterward.
 - An `All` profile that runs the built-in workload set in an efficiency-oriented order and emits one parent historical report for the batch.
-- Historical dashboards that keep profiles separated, compare each run against the previous run in the same profile, and surface diagnostics readiness explicitly.
+- Historical dashboards that keep profiles separated, compare each run against the previous run in the same profile, surface diagnostics readiness explicitly, and call out steady-state averages separately from peak observed values.
 
 Raw device benchmarking is intentionally blocked to reduce destructive risk.
 
@@ -130,6 +134,15 @@ Enable chartable fio diagnostics for throughput, IOPS, and latency time series:
   -EnableLogs
 ```
 
+Capture SMB-side diagnostics as well when running against a share:
+
+```powershell
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath '\\fileserver\sqlbench' `
+  -Profile MaxThroughput `
+  -EnableLogs
+```
+
 Reuse previously prepared files for repeated runs against the same target and settings:
 
 ```powershell
@@ -177,6 +190,49 @@ Dry-run the newer large-block profiles:
 .\scripts\Invoke-FioSqlBench.ps1 `
   -TargetPath 'D:\SqlBench' `
   -Profile All `
+  -DryRun
+```
+
+Apply a throughput cap to a large-block profile:
+
+```powershell
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath '\\fileserver\sqlbench' `
+  -Profile MaxThroughput `
+  -ThroughputCapMBps 250
+```
+
+Apply an IOPS cap to a small-block profile:
+
+```powershell
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath 'D:\SqlBench' `
+  -Profile Data `
+  -IopsCap 30000
+```
+
+When both caps are supplied, the runner only applies the relevant limiter for that workload. Large-block profiles such as `MaxThroughput`, `DbccScan`, and `BackupRestore` use the throughput cap, while small-block profiles such as `Data`, `Tempdb`, `Log`, and `MaxIOPs` use the IOPS cap. The selected limiter is printed in the console as `Limiter used` / `Limiter basis` and carried into the reports as a compact `limit` badge.
+
+Run the full built-in batch on SMB with prep reuse, diagnostics, SMB optimization, and dual caps:
+
+```powershell
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath '\\fileserver\sqlbench' `
+  -Profile All `
+  -EnableLogs `
+  -ReusePreparedFiles `
+  -Optimized `
+  -ThroughputCapMBps 120 `
+  -IopsCap 30000
+```
+
+Preview or apply the temporary SMB client tuning pass:
+
+```powershell
+.\scripts\Invoke-FioSqlBench.ps1 `
+  -TargetPath '\\fileserver\sqlbench' `
+  -Profile MaxThroughput `
+  -Optimized `
   -DryRun
 ```
 
@@ -245,8 +301,9 @@ When `-EnableLogs` is enabled, the run also emits windowed fio diagnostics artif
 - `iter-01-fio_bw.*.log`: raw fio bandwidth logs for that iteration
 - `iter-01-fio_iops.*.log`: raw fio IOPS logs for that iteration
 - `iter-01-fio_clat.*.log`: raw fio completion-latency logs for that iteration
+- `iter-01-perfmon-smb.csv`: host-side SMB client PerfMon counters when diagnostics are enabled for an SMB target and the counters are available on that system
 
-The diagnostics mode uses a `1000 ms` fio logging window so results remain chartable and small enough to keep with the run. Latency logs capture both average and max completion latency per window so short stalls and throttling events are easier to spot.
+The diagnostics mode uses a `1000 ms` fio logging window so results remain chartable and small enough to keep with the run. Latency logs capture both average and max completion latency per window so short stalls and throttling events are easier to spot. The rendered diagnostics view trims early warmup samples, applies light moving-average smoothing, and caps isolated upper-end spikes so the report emphasizes sustained service behavior rather than one-window bursts.
 
 The per-run HTML now reports whether diagnostics were `Disabled`, fully `Available`, `Partial`, or missing because fio never produced readable log files. That makes it easier to separate workload behavior from telemetry collection failures.
 
@@ -254,8 +311,9 @@ The per-run `summary.html` report is generated by the built-in static renderer a
 
 - SQL-oriented result cards summarize read and write health at a glance.
 - Assessment labels carry through the HTML using the same SQL guidance used in the console.
-- When diagnostics are enabled, throughput, IOPS, and completion-latency time-series charts are rendered directly into the report.
+- When diagnostics are enabled, throughput, IOPS, completion-latency, and SMB-client charts are rendered directly into the report when the corresponding telemetry is available.
 - Diagnostics collection status is shown explicitly so missing telemetry is distinguishable from a clean run with diagnostics disabled.
+- Settings badges now include the effective limiter when a cap is in force, so paced runs are distinguishable from uncapped saturation runs.
 
 ## Example Output
 
@@ -280,13 +338,13 @@ The CSV exports now retain additional SQL-relevant tail and stability fields, in
 The historical HTML report is intended to be comparative rather than just archival:
 
 - The overview is driven from the newest run in each profile so no single profile crowds out the rest of the estate.
-- Cross-profile highlight cards call out leaders for read/write IOPS, read/write throughput, and the lowest mean latency result.
+- Cross-profile highlight cards summarize steady-state averages while also calling out peak observed values and the best current low-latency result.
 - Latest-profile cards surface the newest run for each workload with profile focus labels, SQL-fit assessment, and short interpretation blurbs.
 - Diagnostics coverage is retained at the profile level, including `Available`, `Partial`, and failure states for requested telemetry.
 - Each profile card links directly to the matching diagnostics section so you can jump from the overview to the detailed charts quickly.
 - Recent runs are grouped by workload profile so `Data`, `Log`, `Tempdb`, `BackupRestore`, `DbccScan`, `MaxThroughput`, and `MaxIOPs` do not blur together.
 - Each row is compared against the previous run in the same profile, with deltas shown for read/write throughput, read/write IOPS, and read/write `P99` latency.
-- Effective run settings are rendered as compact badges so changes in block size, queue depth, job count, direct I/O mode, runtime, and related knobs are visible at a glance.
+- Effective run settings are rendered as compact badges so changes in block size, queue depth, job count, direct I/O mode, runtime, active limiter, and related knobs are visible at a glance.
 - When a setting changed relative to the previous run, the badge is highlighted and a short `Settings changed:` summary is printed under that row.
 
 The benchmark data files are created under the target directory in a unique subfolder. By default that target subfolder is removed after the run. Use `-NoCleanup` to keep it.
@@ -299,10 +357,13 @@ If a run fails, the target work folder is preserved automatically so the generat
 - When a mapped drive is detected, the console output also shows the backing remote SMB path.
 - SMB tests measure storage, network, client cache, and protocol behavior together.
 - The built-in profiles default to direct I/O for SMB targets as well as local targets. Use `-Direct Off` if you intentionally want a buffered run.
+- With `-EnableLogs`, SMB runs also attempt to capture host-side `SMB Client Shares` counters so the reports can show client-observed latency, queue buildup, and credit-stall behavior alongside fio metrics.
+- With `-Optimized`, the runner captures the current SMB client settings, applies a benchmark-oriented tuning pass for the active run, and restores the original values at the end.
 - If `Get-SmbConnection` can resolve the share, the summary includes connection metadata such as dialect, open handles, encryption, and continuous availability.
 - If `Get-SmbMultichannelConnection` can resolve the server, the summary also includes visible channel and RDMA-capable path counts.
 - SMB console recommendations call out Microsoft guidance for SQL over SMB: ensure enough network bandwidth, prefer SMB Multichannel, and use SMB Direct/RDMA where available.
 - Historical and console interpretation for SMB should be read with the network path in mind. Microsoft’s SQL-over-SMB guidance assumes enough bandwidth for the workload and recommends SMB 3 features such as Multichannel, SMB Direct/RDMA, and continuous availability where applicable.
+- For large-block SMB runs, bursty fio windows with flat SMB queue depth, client latency, and credit stalls are treated as paced service behavior rather than automatic evidence of client distress.
 - A direct-I/O setting on SMB reduces client-side caching risk only if the SMB path honors it. It does not guarantee bypass of server-side or storage-device cache.
 
 ## Safety Notes
